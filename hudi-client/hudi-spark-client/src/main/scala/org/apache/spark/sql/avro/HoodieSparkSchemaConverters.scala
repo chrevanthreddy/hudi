@@ -52,7 +52,22 @@ object HoodieSparkSchemaConverters {
   }
 
   def toHoodieType(catalystType: DataType, nullable: Boolean, recordName: String, nameSpace: String): HoodieSchema = {
-    val schema = catalystType match {
+    toHoodieType(catalystType, nullable, recordName, nameSpace, Metadata.empty)
+  }
+
+  private def toHoodieType(catalystType: DataType,
+                           nullable: Boolean,
+                           recordName: String,
+                           nameSpace: String,
+                           metadata: Metadata): HoodieSchema = {
+    val customLogicalTypeOpt =
+      if (metadata != null && metadata.contains(HoodieSchema.TYPE_METADATA_FIELD)) {
+        Some(HoodieSchema.parseTypeDescriptor(metadata.getString(HoodieSchema.TYPE_METADATA_FIELD)))
+      } else {
+        None
+      }
+
+    val schema = customLogicalTypeOpt.getOrElse(catalystType match {
       // Primitive types
       case BooleanType => HoodieSchema.create(HoodieSchemaType.BOOLEAN)
       case ByteType | ShortType | IntegerType => HoodieSchema.create(HoodieSchemaType.INT)
@@ -89,7 +104,7 @@ object HoodieSparkSchemaConverters {
         // Check if this might be a union (using heuristic like Avro converter)
         if (canBeUnion(st)) {
           val nonNullUnionFieldTypes = st.map { f =>
-            toHoodieType(f.dataType, nullable = false, f.name, childNameSpace)
+            toHoodieType(f.dataType, nullable = false, f.name, childNameSpace, f.metadata)
           }
           val unionFieldTypes = if (nullable) {
             (HoodieSchema.create(HoodieSchemaType.NULL) +: nonNullUnionFieldTypes).asJava
@@ -100,7 +115,7 @@ object HoodieSparkSchemaConverters {
         } else {
           // Create record
           val fields = st.map { f =>
-            val fieldSchema = toHoodieType(f.dataType, f.nullable, f.name, childNameSpace)
+            val fieldSchema = toHoodieType(f.dataType, f.nullable, f.name, childNameSpace, f.metadata)
             val doc = f.getComment.orNull
             // Match existing Avro SchemaConverters behavior: use NULL_VALUE for nullable unions
             // to avoid serializing "default":null in JSON representation
@@ -116,7 +131,7 @@ object HoodieSparkSchemaConverters {
         }
 
       case other => throw new IncompatibleSchemaException(s"Unexpected Spark DataType: $other")
-    }
+    })
 
     // Wrap with null union if nullable (and not already a union)
     if (nullable && catalystType != NullType && schema.getType != HoodieSchemaType.UNION) {
@@ -174,6 +189,20 @@ object HoodieSparkSchemaConverters {
       case HoodieSchemaType.UUID =>
         SchemaType(StringType, nullable = false)
 
+      case HoodieSchemaType.VECTOR =>
+        hoodieSchema match {
+          case vectorSchema: HoodieSchema.Vector =>
+            val elementType = vectorSchema.getVectorElementType match {
+              case HoodieSchema.Vector.VectorElementType.FLOAT => FloatType
+              case HoodieSchema.Vector.VectorElementType.DOUBLE => DoubleType
+              case HoodieSchema.Vector.VectorElementType.INT8 => ByteType
+            }
+            SchemaType(ArrayType(elementType, containsNull = false), nullable = false)
+          case _ =>
+            throw new IncompatibleSchemaException(
+              s"VECTOR type must be HoodieSchema.Vector instance, got: ${hoodieSchema.getClass}")
+        }
+
       // Complex types
       case HoodieSchemaType.RECORD =>
         val fullName = hoodieSchema.getFullName
@@ -187,11 +216,23 @@ object HoodieSparkSchemaConverters {
         val newRecordNames = existingRecordNames + fullName
         val fields = hoodieSchema.getFields.asScala.map { f =>
           val schemaType = toSqlTypeHelper(f.schema(), newRecordNames)
-          val metadata = if (f.doc().isPresent && !f.doc().get().isEmpty) {
-            new MetadataBuilder().putString("comment", f.doc().get()).build()
-          } else {
-            Metadata.empty
+          val metadataBuilder = new MetadataBuilder()
+          if (f.doc().isPresent && !f.doc().get().isEmpty) {
+            metadataBuilder.putString("comment", f.doc().get())
           }
+          f.schema().getNonNullType().getType match {
+            case HoodieSchemaType.VECTOR =>
+              metadataBuilder.putString(
+                HoodieSchema.TYPE_METADATA_FIELD,
+                f.schema().getNonNullType().asInstanceOf[HoodieSchema.Vector].toTypeDescriptor())
+            case HoodieSchemaType.BLOB =>
+              metadataBuilder.putString(
+                HoodieSchema.TYPE_METADATA_FIELD,
+                f.schema().getNonNullType().asInstanceOf[HoodieSchema.Blob].toTypeDescriptor())
+            case _ =>
+          }
+          val metadata =
+            if (metadataBuilder.build() == Metadata.empty) Metadata.empty else metadataBuilder.build()
           StructField(f.name(), schemaType.dataType, schemaType.nullable, metadata)
         }
         SchemaType(StructType(fields.toSeq), nullable = false)

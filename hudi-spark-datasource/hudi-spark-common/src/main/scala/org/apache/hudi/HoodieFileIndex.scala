@@ -122,7 +122,8 @@ case class HoodieFileIndex(spark: SparkSession,
     new SecondaryIndexSupport(spark, metadataConfig, metaClient),
     new ExpressionIndexSupport(spark, schema, metadataConfig, metaClient),
     new BloomFiltersIndexSupport(spark, metadataConfig, metaClient),
-    new ColumnStatsIndexSupport(spark, schema, rawHoodieSchema, metadataConfig, metaClient)
+    new ColumnStatsIndexSupport(spark, schema, rawHoodieSchema, metadataConfig, metaClient),
+    new VectorIndexSupport(spark, rawHoodieSchema, metadataConfig, metaClient)
   )
 
   private val enableHoodieExtension = spark.sessionState.conf.getConfString("spark.sql.extensions", "")
@@ -227,10 +228,13 @@ case class HoodieFileIndex(spark: SparkSession,
       prunePartitionsAndGetFileSlices(dataFilters, partitionFilters)
     hasPushedDownPartitionPredicates = true
 
-    // If there are no data filters, return all the file slices.
+    // If there are no data filters, return all the file slices unless an index explicitly
+    // supports pruning driven by reader options alone (for example, vector coarse pruning).
     // If isPartitionPurge is true, this fun is trigger by HoodiePruneFileSourcePartitions, don't look up candidate files
     // If there are no file slices, return empty list.
-    if (prunedPartitionsAndFileSlices.isEmpty || dataFilters.isEmpty || isPartitionPruned ) {
+    if (prunedPartitionsAndFileSlices.isEmpty
+      || (dataFilters.isEmpty && !shouldLookupCandidateFilesWithoutDataFilters)
+      || isPartitionPruned ) {
       prunedPartitionsAndFileSlices
     } else {
       // Look up candidate files names in the col-stats or record level index, if all of the following conditions are true
@@ -471,6 +475,9 @@ case class HoodieFileIndex(spark: SparkSession,
     idx.getIndexName == SecondaryIndexSupport.INDEX_NAME && idx.isIndexAvailable)
 
   private def isIndexAvailable: Boolean = indicesSupport.exists(idx => idx.isIndexAvailable)
+
+  private def shouldLookupCandidateFilesWithoutDataFilters: Boolean =
+    indicesSupport.exists(idx => idx.canPruneWithEmptyDataFilters(options) && idx.isIndexAvailable)
 
   private def validateConfig(): Unit = {
     if (isDataSkippingEnabled && (!isMetadataTableEnabled || !isIndexAvailable) && !metaClient.isMetadataTable) {

@@ -92,3 +92,4 @@ package-lock.json
 hudi-spark-datasource/hudi-spark/src/test/resources/upgrade-downgrade-fixtures/spark-versions/
 
 CLAUDE.md
+.github/instructions/wmt-copilot.instructions.md
