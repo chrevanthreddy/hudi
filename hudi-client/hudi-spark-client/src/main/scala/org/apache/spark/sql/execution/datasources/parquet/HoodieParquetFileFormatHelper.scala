@@ -20,13 +20,19 @@
 package org.apache.spark.sql.execution.datasources.parquet
 
 import org.apache.hadoop.conf.Configuration
+import org.apache.hudi.common.schema.HoodieSchema
+import org.apache.hudi.io.storage.VectorConversionUtils
 import org.apache.parquet.hadoop.metadata.FileMetaData
 import org.apache.spark.sql.HoodieSchemaUtils
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
+import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.expressions.{ArrayTransform, Attribute, Cast, CreateNamedStruct, CreateStruct, Expression, GetStructField, LambdaFunction, Literal, MapEntries, MapFromEntries, NamedLambdaVariable, UnsafeProjection}
-import org.apache.spark.sql.types.{ArrayType, DataType, DateType, DecimalType, DoubleType, FloatType, IntegerType, LongType, MapType, StringType, StructField, StructType, TimestampNTZType}
+import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DateType, DecimalType, DoubleType, FloatType, IntegerType, LongType, MapType, StringType, StructField, StructType, TimestampNTZType}
 
 object HoodieParquetFileFormatHelper {
+
+  private case class VectorFieldInfo(dimension: Int, elementTypeName: String)
+  private val VectorTypePattern = """VECTOR\((\d+)(?:,\s*(FLOAT|DOUBLE|INT8))?\)""".r
 
   def buildImplicitSchemaChangeInfo(hadoopConf: Configuration,
                                     parquetFileMetaData: FileMetaData,
@@ -109,6 +115,19 @@ object HoodieParquetFileFormatHelper {
                                schemaUtils: HoodieSchemaUtils): UnsafeProjection = {
     val addedCastCache = scala.collection.mutable.HashMap.empty[(DataType, DataType), Boolean]
 
+    def getVectorFieldInfo(field: StructField): Option[VectorFieldInfo] = {
+      if (field.metadata == null || !field.metadata.contains(HoodieSchema.TYPE_METADATA_FIELD)) {
+        None
+      } else {
+        field.metadata.getString(HoodieSchema.TYPE_METADATA_FIELD) match {
+          case VectorTypePattern(dimension, elementType) =>
+            Some(VectorFieldInfo(dimension.toInt, Option(elementType).getOrElse("FLOAT")))
+          case _ =>
+            None
+        }
+      }
+    }
+
     def hasUnsupportedConversion(src: DataType, dst: DataType): Boolean = {
       addedCastCache.getOrElseUpdate((src, dst), {
         (src, dst) match {
@@ -188,7 +207,24 @@ object HoodieParquetFileFormatHelper {
         if (typeChangeInfos.containsKey(i)) {
           val srcType = typeChangeInfos.get(i).getRight
           val dstType = typeChangeInfos.get(i).getLeft
-          recursivelyCastExpressions(attr, srcType, dstType)
+          val vectorFieldInfoOpt =
+            if (i < requiredSchema.length) getVectorFieldInfo(requiredSchema(i)) else None
+          if (vectorFieldInfoOpt.isDefined && srcType == BinaryType && dstType.isInstanceOf[ArrayType]) {
+            val vectorFieldInfo = vectorFieldInfoOpt.get
+            StaticInvoke(
+              classOf[VectorConversionUtils],
+              dstType,
+              "convertBinaryToVectorArray",
+              Seq(
+                attr,
+                Literal(vectorFieldInfo.dimension),
+                Literal(vectorFieldInfo.elementTypeName)
+              ),
+              returnNullable = attr.nullable,
+              isDeterministic = true)
+          } else {
+            recursivelyCastExpressions(attr, srcType, dstType)
+          }
         } else attr
       }
       GenerateUnsafeProjection.generate(castSchema, newFullSchema)

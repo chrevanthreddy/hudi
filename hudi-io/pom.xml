@@ -103,6 +103,16 @@
           <!-- Required to support older Hive versions that still use Java 8 -->
           <target>8</target>
           <release>8</release>
+          <!-- maven-compiler-plugin 3.12+ no longer auto-includes project dependencies
+               on the annotation processor path when the release flag is set; Lombok
+               must be declared explicitly so @Value/@Data/@Slf4j etc. are processed. -->
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.projectlombok</groupId>
+              <artifactId>lombok</artifactId>
+              <version>${lombok.version}</version>
+            </path>
+          </annotationProcessorPaths>
         </configuration>
       </plugin>
       <plugin>

@@ -335,11 +335,11 @@ public class HoodieTableConfig extends HoodieConfig {
       .sinceVersion("1.0.0")
       .withDocumentation("Key Generator type to determine key generator class");
 
-  // TODO: this has to be UTC. why is it not the default?
+  // Timeline instants should be timezone-stable across environments; default to UTC.
   public static final ConfigProperty<HoodieTimelineTimeZone> TIMELINE_TIMEZONE = ConfigProperty
       .key("hoodie.table.timeline.timezone")
-      .defaultValue(HoodieTimelineTimeZone.LOCAL)
-      .withDocumentation("User can set hoodie commit timeline timezone, such as utc, local and so on. local is default");
+      .defaultValue(HoodieTimelineTimeZone.UTC)
+      .withDocumentation("User can set hoodie commit timeline timezone, such as utc, local and so on. utc is default");
 
   public static final ConfigProperty<Boolean> PARTITION_METAFILE_USE_BASE_FORMAT = ConfigProperty
       .key("hoodie.partition.metafile.use.base.format")

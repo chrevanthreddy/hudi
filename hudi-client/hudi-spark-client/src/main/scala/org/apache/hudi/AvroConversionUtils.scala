@@ -19,16 +19,17 @@
 package org.apache.hudi
 
 import org.apache.hudi.HoodieSparkUtils.{getCatalystRowSerDe, sparkAdapter}
-import org.apache.hudi.avro.AvroSchemaUtils
 import org.apache.hudi.common.schema.HoodieSchema
 import org.apache.hudi.exception.SchemaCompatibilityException
 import org.apache.hudi.internal.schema.HoodieSchemaException
+import org.apache.hudi.io.storage.VectorConversionUtils
 
 import org.apache.avro.Schema
 import org.apache.avro.generic.GenericRecord
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Dataset, Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.types.StructType
 
 import java.util.concurrent.ConcurrentHashMap
@@ -61,11 +62,27 @@ object AvroConversionUtils {
    */
   def createInternalRowToAvroConverter(rootCatalystType: StructType, rootAvroType: Schema, nullable: Boolean): InternalRow => GenericRecord = {
     val loader: java.util.function.Function[Tuple3[StructType, Schema, Boolean], Function1[InternalRow, GenericRecord]] = key => {
-      val serializer = sparkAdapter.createAvroSerializer(key._1, HoodieSchema.fromAvroSchema(key._2), key._3)
+      val hoodieSchema = HoodieSchema.fromAvroSchema(key._2)
+      val vectorColumns = VectorConversionUtils.detectVectorColumns(hoodieSchema)
+      val serializerInputSchema =
+        if (vectorColumns.isEmpty) key._1 else VectorConversionUtils.replaceVectorColumnsWithBinary(key._1, vectorColumns)
+      val serializer = sparkAdapter.createAvroSerializer(serializerInputSchema, hoodieSchema, key._3)
+      val serializerInputRow =
+        if (vectorColumns.isEmpty) {
+          (row: InternalRow) => row
+        } else {
+          val mapper = VectorConversionUtils.buildBinaryRowMapper(
+            key._1,
+            vectorColumns,
+            new java.util.function.Function[GenericInternalRow, InternalRow] {
+              override def apply(row: GenericInternalRow): InternalRow = row
+            })
+          (row: InternalRow) => mapper.apply(row)
+        }
       row => {
         try {
           serializer
-            .serialize(row)
+            .serialize(serializerInputRow(row))
             .asInstanceOf[GenericRecord]
         } catch {
           case e: HoodieSchemaException => throw e
@@ -126,8 +143,21 @@ object AvroConversionUtils {
    */
   @Deprecated
   def getAvroRecordNameAndNamespace(tableName: String): (String, String) = {
-    val qualifiedName = AvroSchemaUtils.getAvroRecordQualifiedName(tableName)
+    val sanitizedTableName = sanitizeAvroName(tableName)
+    val qualifiedName = s"hoodie.$sanitizedTableName.${sanitizedTableName}_record"
     val nameParts = qualifiedName.split('.')
     (nameParts.last, nameParts.init.mkString("."))
+  }
+
+  private def sanitizeAvroName(name: String): String = {
+    val invalidFirstCharRegex = "[^A-Za-z_]"
+    val invalidCharRegex = "[^A-Za-z0-9_]"
+    val firstPass =
+      if (name.nonEmpty && name.substring(0, 1).matches(invalidFirstCharRegex)) {
+        name.replaceFirst(invalidFirstCharRegex, "__")
+      } else {
+        name
+      }
+    firstPass.replaceAll(invalidCharRegex, "__")
   }
 }

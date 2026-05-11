@@ -132,7 +132,7 @@ import java.util.stream.Collectors;
  *   <li>Custom properties</li>
  * </ul>
  */
-@NoArgsConstructor(access = AccessLevel.PRIVATE)
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
 public class HoodieSchemaComparatorForSchemaEvolution {
 
   private static final HoodieSchemaComparatorForSchemaEvolution VALIDATOR = new HoodieSchemaComparatorForSchemaEvolution();
@@ -154,6 +154,7 @@ public class HoodieSchemaComparatorForSchemaEvolution {
 
     switch (s1.getType()) {
       case RECORD:
+      case BLOB:
         return recordSchemaEquals(s1, s2);
       case ENUM:
         return enumSchemaEquals(s1, s2);
@@ -163,6 +164,8 @@ public class HoodieSchemaComparatorForSchemaEvolution {
         return mapSchemaEquals(s1, s2);
       case FIXED:
         return fixedSchemaEquals(s1, s2);
+      case VECTOR:
+        return vectorSchemaEquals(s1, s2);
       case UNION:
         return unionSchemaEquals(s1, s2);
       case STRING:
@@ -190,6 +193,10 @@ public class HoodieSchemaComparatorForSchemaEvolution {
   }
 
   protected boolean validateRecord(HoodieSchema s1, HoodieSchema s2) {
+    // BLOB schemas are never error records, so skip the error check for BLOB
+    if (s1.getType() == HoodieSchemaType.BLOB) {
+      return true;
+    }
     return s1.isError() == s2.isError();
   }
 
@@ -282,6 +289,14 @@ public class HoodieSchemaComparatorForSchemaEvolution {
 
   private boolean fixedSchemaEquals(HoodieSchema s1, HoodieSchema s2) {
     return s1.getName().equals(s2.getName()) && s1.getFixedSize() == s2.getFixedSize();
+  }
+
+  private static boolean vectorSchemaEquals(HoodieSchema s1, HoodieSchema s2) {
+    HoodieSchema.Vector v1 = (HoodieSchema.Vector) s1;
+    HoodieSchema.Vector v2 = (HoodieSchema.Vector) s2;
+    return v1.getDimension() == v2.getDimension()
+        && v1.getVectorElementType() == v2.getVectorElementType()
+        && v1.getStorageBacking() == v2.getStorageBacking();
   }
 
   private static boolean decimalSchemaEquals(HoodieSchema s1, HoodieSchema s2) {
