@@ -58,6 +58,24 @@ class TestVectorIndexSupport {
   }
 
   @Test
+  def testCollectCandidateFileNamesByPartitionAndFileGroupMatchesExactGroups(): Unit = {
+    val first = new FileSlice("p1", "001", "fg-1")
+    first.setBaseFile(new HoodieBaseFile(new StoragePathInfo(new StoragePath("file:///tmp/p1-fg-1.parquet"), 0L, false, 0, 0, 0)))
+
+    val second = new FileSlice("p2", "001", "fg-1")
+    second.setBaseFile(new HoodieBaseFile(new StoragePathInfo(new StoragePath("file:///tmp/p2-fg-1.parquet"), 0L, false, 0, 0, 0)))
+
+    val candidateFiles = VectorIndexSupport.collectCandidateFileNamesByPartitionAndFileGroup(
+      Set(("p2", "fg-1")),
+      Seq(
+        (Some(new BaseHoodieTableFileIndex.PartitionPath("p1", Array())), Seq(first)),
+        (Some(new BaseHoodieTableFileIndex.PartitionPath("p2", Array())), Seq(second))),
+      includeLogFiles = false)
+
+    assertEquals(Set("p2-fg-1.parquet"), candidateFiles)
+  }
+
+  @Test
   def testResolveCurrentGenerationIdPrefersManifestRecord(): Unit = {
     val indexPartition = "vector_index_embedding_idx"
     val currentManifest = HoodieMetadataPayload.createVectorIndexManifestRecord(
@@ -95,4 +113,5 @@ class TestVectorIndexSupport {
 
     assertEquals(Seq(1, 2), topClusters)
   }
+
 }

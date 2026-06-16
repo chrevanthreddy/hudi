@@ -150,12 +150,14 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
    */
   public static final String VECTOR_INDEX_FIELD_ENTRY_TYPE = "entryType";
   public static final String VECTOR_INDEX_FIELD_GENERATION_ID = "generationId";
+  public static final String VECTOR_INDEX_FIELD_RECORD_KEY = "recordKey";
   public static final String VECTOR_INDEX_FIELD_SHARD_ID = "shardId";
   public static final String VECTOR_INDEX_FIELD_SHARD_COUNT = "shardCount";
   public static final String VECTOR_INDEX_FIELD_CLUSTER_ID = "clusterId";
   public static final String VECTOR_INDEX_FIELD_CENTROID_BYTES = "centroidBytes";
   public static final String VECTOR_INDEX_FIELD_FILE_GROUP_ID = "fileGroupId";
   public static final String VECTOR_INDEX_FIELD_PARTITION_PATH = "partitionPath";
+  public static final String VECTOR_INDEX_FIELD_BASE_INSTANT_TIME = "baseInstantTime";
   public static final String VECTOR_INDEX_FIELD_FILE_GROUP_IDS = "fileGroupIds";
   public static final String VECTOR_INDEX_FIELD_VECTOR_COUNT = "vectorCount";
   public static final String VECTOR_INDEX_FIELD_LAST_UPDATED_TS = "lastUpdatedTs";
@@ -167,10 +169,8 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
   public static final String VECTOR_INDEX_FIELD_SCALAR = "scalar";
   public static final String VECTOR_INDEX_FIELD_IS_DELETED = FIELD_IS_DELETED;
 
-  public static final String VECTOR_INDEX_ENTRY_TYPE_ASSIGNMENT = "ASSIGNMENT";
   public static final String VECTOR_INDEX_ENTRY_TYPE_CENTROIDS = "CENTROIDS";
   public static final String VECTOR_INDEX_ENTRY_TYPE_QUANTIZER = "QUANTIZER";
-  public static final String VECTOR_INDEX_ENTRY_TYPE_FG_MAPPING = "FG_MAPPING";
   public static final String VECTOR_INDEX_ENTRY_TYPE_MANIFEST = "MANIFEST";
   public static final String VECTOR_INDEX_ENTRY_TYPE_CLUSTER = "CLUSTER";
   public static final String VECTOR_INDEX_ENTRY_TYPE_POSTING = "POSTING";
@@ -296,12 +296,14 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
 
   private static HoodieVectorIndexInfo newVectorIndexInfo(String entryType,
                                                           String generationId,
+                                                          String recordKey,
                                                           int shardId,
                                                           int shardCount,
                                                           int clusterId,
                                                           ByteBuffer centroidBytes,
                                                           String fileGroupId,
                                                           String partitionPath,
+                                                          String baseInstantTime,
                                                           List<String> fileGroupIds,
                                                           long vectorCount,
                                                           long lastUpdatedTs,
@@ -315,12 +317,14 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     return new HoodieVectorIndexInfo(
         entryType,
         generationId,
+        recordKey,
         shardId,
         shardCount,
         clusterId,
         centroidBytes,
         fileGroupId,
         partitionPath,
+        baseInstantTime,
         fileGroupIds,
         vectorCount,
         lastUpdatedTs,
@@ -334,85 +338,6 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
   }
 
   /**
-   * Create a cluster-assignment record: maps {@code recordKey} to {@code clusterId}.
-   */
-  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexAssignmentRecord(
-      String recordKey, int clusterId, String partitionPath) {
-    return createVectorIndexAssignmentRecord(recordKey, null, clusterId, 0, null, null, partitionPath);
-  }
-
-  /**
-   * Create a cluster-assignment record enriched with file-group metadata.
-   */
-  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexAssignmentRecord(
-      String recordKey, int clusterId, String fileGroupId, String dataPartitionPath, String metadataPartitionPath) {
-    return createVectorIndexAssignmentRecord(recordKey, null, clusterId, 0, fileGroupId, dataPartitionPath, metadataPartitionPath);
-  }
-
-  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexAssignmentRecord(
-      String recordKey,
-      String generationId,
-      int clusterId,
-      int shardId,
-      String fileGroupId,
-      String dataPartitionPath,
-      String metadataPartitionPath) {
-    String metadataRecordKey = HoodieTableMetadataUtil.getVectorIndexAssignmentKey(recordKey);
-    HoodieVectorIndexInfo info = newVectorIndexInfo(
-        VECTOR_INDEX_ENTRY_TYPE_ASSIGNMENT,
-        generationId,
-        shardId,
-        0,
-        clusterId,
-        null,
-        fileGroupId,
-        dataPartitionPath,
-        null,
-        0L,
-        0L,
-        null,
-        0,
-        0L,
-        false,
-        null,
-        null,
-        false);
-    HoodieMetadataPayload payload = new HoodieMetadataPayload(metadataRecordKey, info);
-    HoodieKey key = new HoodieKey(metadataRecordKey, metadataPartitionPath);
-    return new HoodieAvroRecord<>(key, payload);
-  }
-
-  /**
-   * Create a tombstone for a cluster-assignment record.
-   */
-  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexDeleteRecord(
-      String recordKey, String partitionPath) {
-    String metadataRecordKey = HoodieTableMetadataUtil.getVectorIndexAssignmentKey(recordKey);
-    HoodieVectorIndexInfo info = newVectorIndexInfo(
-        null,
-        null,
-        0,
-        0,
-        -1,
-        null,
-        null,
-        null,
-        null,
-        0L,
-        0L,
-        null,
-        0,
-        0L,
-        false,
-        null,
-        null,
-        true);
-    HoodieMetadataPayload payload = new HoodieMetadataPayload(metadataRecordKey, info);
-    HoodieKey key = new HoodieKey(metadataRecordKey, partitionPath);
-    return new HoodieAvroRecord<>(key, payload);
-  }
-
-  /**
    * Create the special centroid-dump record for the given index partition.
    * Key is always {@link HoodieTableMetadataUtil#VECTOR_INDEX_CENTROIDS_KEY}.
    */
@@ -421,10 +346,12 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     HoodieVectorIndexInfo info = newVectorIndexInfo(
         VECTOR_INDEX_ENTRY_TYPE_CENTROIDS,
         null,
+        null,
         0,
         0,
         -1,
         centroidBytes,
+        null,
         null,
         null,
         null,
@@ -457,9 +384,11 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     HoodieVectorIndexInfo info = newVectorIndexInfo(
         VECTOR_INDEX_ENTRY_TYPE_QUANTIZER,
         null,
+        null,
         0,
         0,
         -1,
+        null,
         null,
         null,
         null,
@@ -480,41 +409,6 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     return new HoodieAvroRecord<>(key, payload);
   }
 
-  /**
-   * Create an fg_mapping row storing the forward map cluster_id -> file_group_ids for a partition.
-   */
-  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexFgMappingRecord(
-      int clusterId,
-      String dataPartitionPath,
-      Collection<String> fileGroupIds,
-      long vectorCount,
-      long lastUpdatedTs,
-      String metadataPartitionPath) {
-    String recordKey = HoodieTableMetadataUtil.getVectorIndexFgMappingKey(clusterId, dataPartitionPath);
-    HoodieVectorIndexInfo info = newVectorIndexInfo(
-        VECTOR_INDEX_ENTRY_TYPE_FG_MAPPING,
-        null,
-        0,
-        0,
-        clusterId,
-        null,
-        null,
-        dataPartitionPath,
-        new ArrayList<>(fileGroupIds),
-        vectorCount,
-        lastUpdatedTs,
-        null,
-        0,
-        0L,
-        false,
-        null,
-        null,
-        false);
-    HoodieMetadataPayload payload = new HoodieMetadataPayload(recordKey, info);
-    HoodieKey key = new HoodieKey(recordKey, metadataPartitionPath);
-    return new HoodieAvroRecord<>(key, payload);
-  }
-
   public static HoodieRecord<HoodieMetadataPayload> createVectorIndexManifestRecord(
       String generationId,
       String quantizerType,
@@ -526,9 +420,11 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     HoodieVectorIndexInfo info = newVectorIndexInfo(
         VECTOR_INDEX_ENTRY_TYPE_MANIFEST,
         generationId,
+        null,
         0,
         0,
         -1,
+        null,
         null,
         null,
         null,
@@ -556,13 +452,16 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
       boolean assumeNormalized,
       long lastUpdatedTs,
       String metadataPartitionPath) {
-    String recordKey = HoodieTableMetadataUtil.getVectorIndexGenerationManifestKey(Integer.parseInt(generationId));
+    String recordKey = HoodieTableMetadataUtil.getVectorIndexGenerationManifestKey(
+        HoodieTableMetadataUtil.toVectorGenerationId(generationId));
     HoodieVectorIndexInfo info = newVectorIndexInfo(
         VECTOR_INDEX_ENTRY_TYPE_MANIFEST,
         generationId,
+        null,
         0,
         0,
         -1,
+        null,
         null,
         null,
         null,
@@ -589,13 +488,16 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
       long vectorCount,
       long lastUpdatedTs,
       String metadataPartitionPath) {
-    String recordKey = HoodieTableMetadataUtil.getVectorIndexClusterKey(Integer.parseInt(generationId), clusterId);
+    String recordKey = HoodieTableMetadataUtil.getVectorIndexClusterKey(
+        HoodieTableMetadataUtil.toVectorGenerationId(generationId), clusterId);
     HoodieVectorIndexInfo info = newVectorIndexInfo(
         VECTOR_INDEX_ENTRY_TYPE_CLUSTER,
         generationId,
+        null,
         0,
         shardCount,
         clusterId,
+        null,
         null,
         null,
         null,
@@ -620,6 +522,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
       int clusterId,
       String fileGroupId,
       String dataPartitionPath,
+      String baseInstantTime,
       byte[] binaryCode,
       Float scalar,
       long lastUpdatedTs,
@@ -631,6 +534,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
         0,
         fileGroupId,
         dataPartitionPath,
+        baseInstantTime,
         binaryCode,
         scalar,
         lastUpdatedTs,
@@ -644,6 +548,7 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
       int shardId,
       String fileGroupId,
       String dataPartitionPath,
+      String baseInstantTime,
       byte[] binaryCode,
       Float scalar,
       long lastUpdatedTs,
@@ -652,12 +557,14 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     HoodieVectorIndexInfo info = newVectorIndexInfo(
         VECTOR_INDEX_ENTRY_TYPE_POSTING,
         generationId,
+        recordKey,
         shardId,
         0,
         clusterId,
         null,
         fileGroupId,
         dataPartitionPath,
+        baseInstantTime,
         null,
         0L,
         lastUpdatedTs,
@@ -668,6 +575,42 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
         binaryCode == null ? null : ByteBuffer.wrap(binaryCode),
         scalar,
         false);
+    HoodieMetadataPayload payload = new HoodieMetadataPayload(metadataRecordKey, info);
+    HoodieKey key = new HoodieKey(metadataRecordKey, metadataPartitionPath);
+    return new HoodieAvroRecord<>(key, payload);
+  }
+
+  /**
+   * Create a tombstone for a canonical vector posting record.
+   */
+  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexPostingDeleteRecord(
+      String generationId,
+      String recordKey,
+      int clusterId,
+      int shardId,
+      String metadataPartitionPath) {
+    String metadataRecordKey = HoodieTableMetadataUtil.getVectorIndexPostingKey(generationId, clusterId, shardId, recordKey);
+    HoodieVectorIndexInfo info = newVectorIndexInfo(
+        VECTOR_INDEX_ENTRY_TYPE_POSTING,
+        generationId,
+        recordKey,
+        shardId,
+        0,
+        clusterId,
+        null,
+        null,
+        null,
+        null,
+        null,
+        0L,
+        0L,
+        null,
+        0,
+        0L,
+        false,
+        null,
+        null,
+        true);
     HoodieMetadataPayload payload = new HoodieMetadataPayload(metadataRecordKey, info);
     HoodieKey key = new HoodieKey(metadataRecordKey, metadataPartitionPath);
     return new HoodieAvroRecord<>(key, payload);

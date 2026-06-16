@@ -123,6 +123,38 @@ public final class VectorIndexOptions {
    */
   public static final String RABITQ_POSTING_MAX_SHARDS_PER_CLUSTER = "vector.rabitq.posting.max_shards_per_cluster";
 
+  // ---- search-time options ------------------------------------------------
+
+  /**
+   * Controls the exact-read behaviour of {@code hudi_vector_search}.
+   * <ul>
+   *   <li>{@code exact} (default) — reads base-table rows and computes exact
+   *       vector distances for the top-K candidates.</li>
+   *   <li>{@code approximate} — skips the base-table read entirely and returns
+   *       RaBitQ approximate distances.  Much faster (no Parquet I/O) but
+   *       distances are estimates and only record-key / partition-path columns
+   *       are returned.</li>
+   * </ul>
+   */
+  public static final String SEARCH_MODE = "vector.search.mode";
+  public static final String DEFAULT_SEARCH_MODE = "exact";
+
+  /**
+   * When {@code true}, Hudi clustering on the <b>main data table</b> will sort
+   * records by their IVF K-Means cluster assignment (read from vector index
+   * posting records in the MDT).  This co-locates vectors that belong to the
+   * same IVF cluster in the same data-table file groups, so the exact-read
+   * phase of {@code hudi_vector_search} opens far fewer files (probed clusters
+   * map to a handful of file groups instead of being scattered across all of
+   * them).
+   *
+   * <p>To use this, set this option on the vector index definition and then
+   * configure Hudi clustering on the main data table.  The clustering
+   * execution strategy will look up each record's cluster ID from the MDT and
+   * use it as the sort key.
+   */
+  public static final String CLUSTERING_DATA_TABLE_BY_IVF = "vector.data_table.cluster_by_ivf";
+
   // ---- PQ-specific options (legacy, low-dimensional only) ----------------
 
   /** Number of PQ sub-quantizers M. Default: dimension / 8. */
@@ -141,7 +173,7 @@ public final class VectorIndexOptions {
   public static final int    DEFAULT_REFINE_FACTOR = 10;
   public static final int    DEFAULT_MAX_ITER     = 20;
   public static final long   DEFAULT_RABITQ_SEED  = 42L;
-  public static final String DEFAULT_RABITQ_STORAGE = "hidden_columns";
+  public static final String DEFAULT_RABITQ_STORAGE = "both";
   public static final int    DEFAULT_RABITQ_POSTING_TARGET_ROWS_PER_SHARD = 4096;
   public static final int    DEFAULT_RABITQ_POSTING_MAX_SHARDS_PER_CLUSTER = 64;
   public static final int    DEFAULT_PQ_BITS      = 8;
@@ -233,5 +265,17 @@ public final class VectorIndexOptions {
   public static int getPqNumSubQuantizers(Map<String, String> opts, int dimension) {
     return Integer.parseInt(
         opts.getOrDefault(PQ_NUM_SUB_QUANTIZERS, String.valueOf(dimension / 8)));
+  }
+
+  public static String getSearchMode(Map<String, String> opts) {
+    return opts.getOrDefault(SEARCH_MODE, DEFAULT_SEARCH_MODE).toLowerCase();
+  }
+
+  public static boolean isApproximateSearchMode(Map<String, String> opts) {
+    return "approximate".equals(getSearchMode(opts));
+  }
+
+  public static boolean isDataTableClusterByIvf(Map<String, String> opts) {
+    return Boolean.parseBoolean(opts.getOrDefault(CLUSTERING_DATA_TABLE_BY_IVF, "false"));
   }
 }

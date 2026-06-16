@@ -29,10 +29,12 @@ import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.metadata.HoodieMetadataPayload;
 import org.apache.hudi.metadata.HoodieTableMetadata;
-import org.apache.hudi.metadata.HoodieTableMetadataUtil;
 import org.apache.hudi.metadata.RawKey;
 import org.apache.hudi.metadata.VectorClusterRawKey;
 import org.apache.hudi.metadata.VectorPostingPrefixRawKey;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.nio.ByteBuffer;
@@ -41,18 +43,21 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Shared helper for MDT-native vector posting lookup and approximate candidate reduction.
  *
  * <p>This provides the missing second-stage building block after coarse IVF cluster pruning:
  * exact HFile lookups of cluster metadata, prefix scans over {@code P|gen|cluster|shard|},
- * approximate RaBitQ scoring, and optional map-back through the record index.
+ * approximate RaBitQ scoring, and direct file-slice targeting from posting payload metadata.
  */
 public final class VectorIndexMdtSearchUtils {
 
+  private static final Logger LOG = LoggerFactory.getLogger(VectorIndexMdtSearchUtils.class);
   private static final int TOP_K_REDUCER_KEY = 0;
 
   private VectorIndexMdtSearchUtils() {
@@ -91,6 +96,52 @@ public final class VectorIndexMdtSearchUtils {
     return shardCounts;
   }
 
+  public static Map<Integer, Set<String>> readClusterFileGroups(HoodieTableMetadata metadataTable,
+                                                                 String indexPartition,
+                                                                 int generationId,
+                                                                 Collection<Integer> clusterIds,
+                                                                 Collection<String> partitionPaths,
+                                                                 boolean shouldLoadInMemory) {
+    if (clusterIds == null || clusterIds.isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    Set<String> partitionFilter =
+        partitionPaths == null || partitionPaths.isEmpty() ? Collections.emptySet() : new HashSet<>(partitionPaths);
+    List<RawKey> clusterKeys = new ArrayList<>(clusterIds.size());
+    for (Integer clusterId : clusterIds) {
+      clusterKeys.add(new VectorClusterRawKey(generationId, clusterId));
+    }
+
+    List<HoodieRecord<HoodieMetadataPayload>> records = metadataTable
+        .getRecordsByKeyPrefixes(HoodieListData.eager(clusterKeys), indexPartition, shouldLoadInMemory)
+        .collectAsList();
+
+    Map<Integer, Set<String>> clusterToFileGroups = new HashMap<>();
+    for (HoodieRecord<HoodieMetadataPayload> record : records) {
+      Option<HoodieVectorIndexInfo> infoOpt = getVectorInfo(record);
+      if (!infoOpt.isPresent()) {
+        continue;
+      }
+
+      HoodieVectorIndexInfo info = infoOpt.get();
+      if (!HoodieMetadataPayload.VECTOR_INDEX_ENTRY_TYPE_CLUSTER.equals(info.getEntryType())
+          || info.getFileGroupIds() == null
+          || info.getFileGroupIds().isEmpty()) {
+        continue;
+      }
+      if (!partitionFilter.isEmpty()
+          && info.getPartitionPath() != null
+          && !partitionFilter.contains(info.getPartitionPath())) {
+        continue;
+      }
+      clusterToFileGroups
+          .computeIfAbsent(info.getClusterId(), ignored -> new HashSet<>())
+          .addAll(info.getFileGroupIds());
+    }
+    return clusterToFileGroups;
+  }
+
   public static List<VectorPostingPrefixRawKey> buildPostingPrefixes(int generationId,
                                                                      Map<Integer, Integer> clusterShardCounts) {
     if (clusterShardCounts == null || clusterShardCounts.isEmpty()) {
@@ -122,7 +173,7 @@ public final class VectorIndexMdtSearchUtils {
     }
 
     List<RawKey> rawKeys = new ArrayList<>(postingPrefixes);
-    return metadataTable.getRecordsByKeyPrefixes(HoodieListData.eager(rawKeys), indexPartition, shouldLoadInMemory)
+    HoodieData<PostingMatch> matches = metadataTable.getRecordsByKeyPrefixes(HoodieListData.eager(rawKeys), indexPartition, shouldLoadInMemory)
         .flatMap(record -> {
           Option<HoodieVectorIndexInfo> infoOpt = getVectorInfo(record);
           if (!infoOpt.isPresent()) {
@@ -136,7 +187,7 @@ public final class VectorIndexMdtSearchUtils {
             return Collections.<PostingMatch>emptyIterator();
           }
 
-          String recordKey = HoodieTableMetadataUtil.getVectorIndexPostingRecordKey(record.getRecordKey());
+          String recordKey = info.getRecordKey();
           if (recordKey == null) {
             return Collections.<PostingMatch>emptyIterator();
           }
@@ -150,10 +201,87 @@ public final class VectorIndexMdtSearchUtils {
               info.getShardId(),
               info.getFileGroupId(),
               info.getPartitionPath(),
+              info.getBaseInstantTime(),
               binaryCode,
               info.getScalar());
           return Collections.singletonList(match).iterator();
         });
+    return matches.mapPartitions(iterator -> {
+      long startMs = System.currentTimeMillis();
+      List<PostingMatch> partitionMatches = new ArrayList<>();
+      long binaryCodeBytes = 0L;
+      Set<Integer> clusters = new HashSet<>();
+      Set<String> fileGroups = new HashSet<>();
+      while (iterator.hasNext()) {
+        PostingMatch match = iterator.next();
+        partitionMatches.add(match);
+        if (match.getBinaryCode() != null) {
+          binaryCodeBytes += match.getBinaryCode().length;
+        }
+        clusters.add(match.getClusterId());
+        if (match.getFileGroupId() != null) {
+          fileGroups.add(match.getFileGroupId());
+        }
+      }
+      LOG.info("[vector_search][stage][read_postings] prefixes={} shouldLoadInMemory={} matches={} codeBytes={} distinctClusters={} distinctFileGroups={} elapsedMs={}",
+          postingPrefixes.size(),
+          shouldLoadInMemory,
+          partitionMatches.size(),
+          binaryCodeBytes,
+          clusters.size(),
+          fileGroups.size(),
+          System.currentTimeMillis() - startMs);
+      return partitionMatches.iterator();
+    }, true);
+  }
+
+  public static Map<Integer, Set<String>> collectClusterToFileGroups(HoodieTableMetadata metadataTable,
+                                                                     String indexPartition,
+                                                                     int generationId,
+                                                                     Map<Integer, Integer> clusterShardCounts,
+                                                                     Collection<String> partitionPaths,
+                                                                     boolean shouldLoadInMemory) {
+    if (clusterShardCounts == null || clusterShardCounts.isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    Set<String> partitionFilter =
+        partitionPaths == null || partitionPaths.isEmpty() ? Collections.emptySet() : new HashSet<>(partitionPaths);
+    List<PostingMatch> postingMatches = readPostingMatches(
+        metadataTable, indexPartition, generationId, clusterShardCounts, shouldLoadInMemory).collectAsList();
+    Map<Integer, Set<String>> clusterToFileGroups = new HashMap<>();
+    for (PostingMatch match : postingMatches) {
+      if (match.getFileGroupId() == null) {
+        continue;
+      }
+      if (!partitionFilter.isEmpty()
+          && match.getPartitionPath() != null
+          && !partitionFilter.contains(match.getPartitionPath())) {
+        continue;
+      }
+      clusterToFileGroups
+          .computeIfAbsent(match.getClusterId(), ignored -> new HashSet<>())
+          .add(match.getFileGroupId());
+    }
+    return clusterToFileGroups;
+  }
+
+  /**
+   * Reads all posting records from the vector index partition and returns a mapping
+   * from record key to IVF cluster ID.  This is used for vector-aware clustering:
+   * by sorting main table records by their cluster assignment during Hudi clustering,
+   * records from the same IVF cluster are co-located in the same file groups, which
+   * dramatically reduces I/O during the exact-read phase of vector search.
+   */
+  public static HoodiePairData<String, Integer> readClusterAssignments(
+      HoodieTableMetadata metadataTable,
+      String indexPartition,
+      int generationId,
+      Map<Integer, Integer> clusterShardCounts,
+      boolean shouldLoadInMemory) {
+    HoodieData<PostingMatch> postings = readPostingMatches(
+        metadataTable, indexPartition, generationId, clusterShardCounts, shouldLoadInMemory);
+    return postings.mapToPair(p -> Pair.of(p.getRecordKey(), p.getClusterId()));
   }
 
   public static HoodieData<ScoredPostingMatch> scorePostingMatches(HoodieData<PostingMatch> postingMatches,
@@ -161,22 +289,48 @@ public final class VectorIndexMdtSearchUtils {
                                                                    int dimension,
                                                                    long randomSeed,
                                                                    boolean assumeNormalized) {
+    long queryPrepStartMs = System.currentTimeMillis();
+    RaBitQEncoder encoder = new RaBitQEncoder(dimension, randomSeed, assumeNormalized);
+    RaBitQEncoder.RaBitQQueryState queryState = (RaBitQEncoder.RaBitQQueryState) encoder.encodeQuery(queryVector);
+    long queryPrepMs = System.currentTimeMillis() - queryPrepStartMs;
+    LOG.info("[vector_search][stage][score_postings_setup] queryDim={} queryCodeBytes={} elapsedMs={}",
+        dimension,
+        queryState.binaryCode.length,
+        queryPrepMs);
     return postingMatches.mapPartitions(iterator -> {
+      long partitionStartMs = System.currentTimeMillis();
       if (!iterator.hasNext()) {
+        LOG.info("[vector_search][stage][score_postings] input=0 output=0 queryDim={} computeMs=0 elapsedMs={}",
+            dimension,
+            System.currentTimeMillis() - partitionStartMs);
         return Collections.<ScoredPostingMatch>emptyIterator();
       }
 
-      RaBitQEncoder encoder = new RaBitQEncoder(dimension, randomSeed, assumeNormalized);
-      VectorQuantizer.QueryState queryState = encoder.encodeQuery(queryVector);
       List<ScoredPostingMatch> scored = new ArrayList<>();
+      float minDistance = Float.POSITIVE_INFINITY;
+      float maxDistance = Float.NEGATIVE_INFINITY;
+      long computeStartMs = System.currentTimeMillis();
       while (iterator.hasNext()) {
         PostingMatch match = iterator.next();
         float effectiveScalar = match.getScalar() != null ? match.getScalar() : 1.0f;
-        float approxDistance = encoder.estimateDistance(
-            queryState,
-            new VectorQuantizer.QuantizedVector(match.getBinaryCode(), effectiveScalar));
+        float approxDistance = RaBitQEncoder.estimateDistance(
+            queryState.binaryCode,
+            match.getBinaryCode(),
+            effectiveScalar,
+            dimension);
         scored.add(new ScoredPostingMatch(match, approxDistance, null));
+        minDistance = Math.min(minDistance, approxDistance);
+        maxDistance = Math.max(maxDistance, approxDistance);
       }
+      long computeMs = System.currentTimeMillis() - computeStartMs;
+      LOG.info("[vector_search][stage][score_postings] input={} output={} queryDim={} minDist={} maxDist={} computeMs={} elapsedMs={}",
+          scored.size(),
+          scored.size(),
+          dimension,
+          scored.isEmpty() ? "n/a" : minDistance,
+          scored.isEmpty() ? "n/a" : maxDistance,
+          computeMs,
+          System.currentTimeMillis() - partitionStartMs);
       return scored.iterator();
     }, true);
   }
@@ -205,11 +359,18 @@ public final class VectorIndexMdtSearchUtils {
 
     HoodiePairData<Integer, List<ScoredPostingMatch>> partialTopK = candidates
         .mapPartitions(iterator -> {
+          long startMs = System.currentTimeMillis();
           List<ScoredPostingMatch> localTopK = new ArrayList<>();
           while (iterator.hasNext()) {
             localTopK.add(iterator.next());
           }
+          int inputCount = localTopK.size();
           trimTopK(localTopK, topK);
+          LOG.info("[vector_search][stage][select_topk_local] input={} kept={} topK={} elapsedMs={}",
+              inputCount,
+              localTopK.size(),
+              topK,
+              System.currentTimeMillis() - startMs);
           if (localTopK.isEmpty()) {
             return Collections.<Pair<Integer, List<ScoredPostingMatch>>>emptyIterator();
           }
@@ -220,7 +381,19 @@ public final class VectorIndexMdtSearchUtils {
     return partialTopK
         .reduceByKey((left, right) -> mergeTopK(left, right, topK), 1)
         .values()
-        .flatMap(List::iterator);
+        .flatMap(List::iterator)
+        .mapPartitions(iterator -> {
+          long startMs = System.currentTimeMillis();
+          List<ScoredPostingMatch> finalTopK = new ArrayList<>();
+          while (iterator.hasNext()) {
+            finalTopK.add(iterator.next());
+          }
+          LOG.info("[vector_search][stage][select_topk_final] kept={} topK={} elapsedMs={}",
+              finalTopK.size(),
+              topK,
+              System.currentTimeMillis() - startMs);
+          return finalTopK.iterator();
+        }, true);
   }
 
   public static List<ScoredPostingMatch> collectTopKWithLocations(HoodieTableMetadata metadataTable,
@@ -279,6 +452,7 @@ public final class VectorIndexMdtSearchUtils {
     private final int shardId;
     private final String fileGroupId;
     private final String partitionPath;
+    private final String baseInstantTime;
     private final byte[] binaryCode;
     private final Float scalar;
 
@@ -287,6 +461,7 @@ public final class VectorIndexMdtSearchUtils {
                         int shardId,
                         String fileGroupId,
                         String partitionPath,
+                        String baseInstantTime,
                         byte[] binaryCode,
                         Float scalar) {
       this.recordKey = recordKey;
@@ -294,6 +469,7 @@ public final class VectorIndexMdtSearchUtils {
       this.shardId = shardId;
       this.fileGroupId = fileGroupId;
       this.partitionPath = partitionPath;
+      this.baseInstantTime = baseInstantTime;
       this.binaryCode = binaryCode;
       this.scalar = scalar;
     }
@@ -318,6 +494,10 @@ public final class VectorIndexMdtSearchUtils {
       return partitionPath;
     }
 
+    public String getBaseInstantTime() {
+      return baseInstantTime;
+    }
+
     public byte[] getBinaryCode() {
       return binaryCode;
     }
@@ -338,6 +518,7 @@ public final class VectorIndexMdtSearchUtils {
           match.getShardId(),
           match.getFileGroupId(),
           match.getPartitionPath(),
+          match.getBaseInstantTime(),
           match.getBinaryCode(),
           match.getScalar());
       this.approxDistance = approxDistance;

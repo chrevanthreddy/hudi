@@ -23,44 +23,35 @@ import org.apache.hudi.common.model.HoodieRecord;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.Arrays;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TestVectorIndexMetadataPayload {
 
   @Test
-  void testAssignmentRecordCarriesFileGroupMetadata() {
-    HoodieRecord<HoodieMetadataPayload> record = HoodieMetadataPayload.createVectorIndexAssignmentRecord(
+  void testPostingRecordCarriesCanonicalLookupMetadata() {
+    HoodieRecord<HoodieMetadataPayload> record = HoodieMetadataPayload.createVectorIndexPostingRecord(
+        "7",
         "rk-1",
-        7,
+        3,
+        1,
         "file-group-1",
         "dt=2026-04-01",
-        "vector_index_demo");
-
-    assertTrue(record.getData().getVectorIndexMetadata().isPresent());
-    assertEquals(7, record.getData().getVectorIndexMetadata().get().getClusterId());
-    assertEquals("file-group-1", record.getData().getVectorIndexMetadata().get().getFileGroupId());
-    assertEquals("dt=2026-04-01", record.getData().getVectorIndexMetadata().get().getPartitionPath());
-  }
-
-  @Test
-  void testFgMappingRecordUsesForwardMapKey() {
-    HoodieRecord<HoodieMetadataPayload> record = HoodieMetadataPayload.createVectorIndexFgMappingRecord(
-        3,
-        "dt=2026-04-01",
-        Arrays.asList("fg-1", "fg-2"),
-        12L,
+        "20260603120000",
+        new byte[] {0x01, 0x02},
+        1.5f,
         123456789L,
         "vector_index_demo");
 
-    assertTrue(HoodieTableMetadataUtil.isVectorIndexFgMappingKey(record.getRecordKey()));
     assertTrue(record.getData().getVectorIndexMetadata().isPresent());
+    assertEquals(HoodieMetadataPayload.VECTOR_INDEX_ENTRY_TYPE_POSTING,
+        record.getData().getVectorIndexMetadata().get().getEntryType());
+    assertEquals("rk-1", record.getData().getVectorIndexMetadata().get().getRecordKey());
     assertEquals(3, record.getData().getVectorIndexMetadata().get().getClusterId());
-    assertEquals(Arrays.asList("fg-1", "fg-2"), record.getData().getVectorIndexMetadata().get().getFileGroupIds());
-    assertEquals(12L, record.getData().getVectorIndexMetadata().get().getVectorCount());
-    assertEquals(123456789L, record.getData().getVectorIndexMetadata().get().getLastUpdatedTs());
+    assertEquals(1, record.getData().getVectorIndexMetadata().get().getShardId());
+    assertEquals("file-group-1", record.getData().getVectorIndexMetadata().get().getFileGroupId());
+    assertEquals("dt=2026-04-01", record.getData().getVectorIndexMetadata().get().getPartitionPath());
+    assertEquals("20260603120000", record.getData().getVectorIndexMetadata().get().getBaseInstantTime());
   }
 
   @Test

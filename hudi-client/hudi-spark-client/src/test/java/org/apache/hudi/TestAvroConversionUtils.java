@@ -71,7 +71,7 @@ public class TestAvroConversionUtils {
     Function1<org.apache.spark.sql.catalyst.InternalRow, GenericRecord> converter =
         AvroConversionUtils$.MODULE$.createInternalRowToAvroConverter(
             catalystSchema,
-            hoodieSchema.toAvroSchema(),
+            hoodieSchema,
             hoodieSchema.isNullable());
 
     GenericRecord record = converter.apply(row);

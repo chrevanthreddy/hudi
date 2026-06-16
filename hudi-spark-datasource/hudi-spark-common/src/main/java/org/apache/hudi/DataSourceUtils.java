@@ -72,6 +72,8 @@ import static org.apache.hudi.common.util.CommitUtils.getCheckpointValueAsString
 @Slf4j
 public class DataSourceUtils {
 
+  private static final String STREAMING_SINK_CHECKPOINT_KEY = "_hudi_streaming_sink_checkpoint";
+
   public static String getTablePath(HoodieStorage storage,
                                     List<StoragePath> userProvidedPaths) throws IOException {
     log.info("Getting table path..");
@@ -138,7 +140,7 @@ public class DataSourceUtils {
       });
     }
     if (properties.containsKey(HoodieSparkSqlWriter.SPARK_STREAMING_BATCH_ID())) {
-      extraMetadataMap.put(HoodieStreamingSink.SINK_CHECKPOINT_KEY(),
+      extraMetadataMap.put(STREAMING_SINK_CHECKPOINT_KEY,
           getCheckpointValueAsString(properties.getOrDefault(DataSourceWriteOptions.STREAMING_CHECKPOINT_IDENTIFIER().key(),
                   DataSourceWriteOptions.STREAMING_CHECKPOINT_IDENTIFIER().defaultValue()),
               properties.get(HoodieSparkSqlWriter.SPARK_STREAMING_BATCH_ID())));

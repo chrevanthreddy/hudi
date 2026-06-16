@@ -170,12 +170,18 @@ class VectorIndexSupport(spark: SparkSession,
     if (topKList.isEmpty) {
       Option.empty
     } else {
-      // Extract ONLY the file groups containing top-K records
-      val targetFileGroups = topKList.asScala.map(_.getFileGroupId).filter(_ != null).toSet
-      if (targetFileGroups.isEmpty) {
+      val targetGroups = topKList.asScala
+        .flatMap { candidate =>
+          Option(candidate.getFileGroupId).map(fgId => (Option(candidate.getPartitionPath).getOrElse(""), fgId))
+        }
+        .toSet
+      if (targetGroups.isEmpty) {
         Option.empty
       } else {
-        Some(VectorIndexSupport.collectCandidateFileNames(targetFileGroups, prunedPartitionsAndFileSlices, includeLogFiles))
+        Some(VectorIndexSupport.collectCandidateFileNamesByPartitionAndFileGroup(
+          targetGroups,
+          prunedPartitionsAndFileSlices,
+          includeLogFiles))
       }
     }
   }
@@ -258,7 +264,25 @@ object VectorIndexSupport {
     }.toSet
   }
 
-  // ---- Legacy helpers (kept for backward compatibility with existing tests) ----
+  def collectCandidateFileNamesByPartitionAndFileGroup(
+      candidateGroups: Set[(String, String)],
+      prunedPartitionsAndFileSlices: Seq[(Option[BaseHoodieTableFileIndex.PartitionPath], Seq[FileSlice])],
+      includeLogFiles: Boolean): Set[String] = {
+    prunedPartitionsAndFileSlices.flatMap {
+      case (partitionOpt, fileSlices) =>
+        val partitionPath = partitionOpt.map(_.getPath).getOrElse("")
+        fileSlices
+          .filter(fs => candidateGroups.contains((partitionPath, fs.getFileId)))
+          .flatMap { fileSlice =>
+            val baseFileName = Option(fileSlice.getBaseFile.orElse(null)).map(_.getFileName).toSeq
+            val logFileNames =
+              if (includeLogFiles) fileSlice.getLogFiles.iterator.asScala.map(_.getFileName).toSeq else Seq.empty
+            baseFileName ++ logFileNames
+          }
+    }.toSet
+  }
+
+  // ---- Test-visible helpers -------------------------------------------------
 
   def deserializeCentroids(bytes: ByteBuffer, vectorSchema: HoodieSchema.Vector): Array[Array[Float]] = {
     VectorIndexMetadataCache.deserializeCentroids(bytes, vectorSchema)
@@ -309,33 +333,6 @@ object VectorIndexSupport {
           acc.updated(info.getClusterId, acc.getOrElse(info.getClusterId, Set.empty[String]) ++ fileGroups)
         }
       }
-  }
-
-  private[hudi] def buildClusterMapFromLegacyFgRecords(records: Seq[HoodieRecord[HoodieMetadataPayload]],
-                                                       partitionFilter: Option[Set[String]]): Map[Int, Set[String]] = {
-    records
-      .filter(record => HoodieTableMetadataUtil.isVectorIndexFgMappingKey(record.getRecordKey))
-      .flatMap(extractVectorMetadata)
-      .filter(info => Option(info.getPartitionPath).forall(path => partitionFilter.forall(_.contains(path))))
-      .foldLeft(Map.empty[Int, Set[String]]) { (acc, info) =>
-        val fileGroups = Option(info.getFileGroupIds).map(_.asScala.toSet).getOrElse(Set.empty[String])
-        if (fileGroups.isEmpty) {
-          acc
-        } else {
-          acc.updated(info.getClusterId, acc.getOrElse(info.getClusterId, Set.empty[String]) ++ fileGroups)
-        }
-      }
-  }
-
-  private[hudi] def mergeClusterMaps(primary: Map[Int, Set[String]],
-                                     fallback: Map[Int, Set[String]]): Map[Int, Set[String]] = {
-    fallback.foldLeft(primary) { case (acc, (clusterId, fileGroups)) =>
-      if (fileGroups.isEmpty) {
-        acc
-      } else {
-        acc.updated(clusterId, acc.getOrElse(clusterId, Set.empty[String]) ++ fileGroups)
-      }
-    }
   }
 
   private def extractVectorMetadata(record: HoodieRecord[HoodieMetadataPayload]) = {

@@ -460,14 +460,11 @@ public class SparkHoodieBackedTableMetadataWriter extends HoodieBackedTableMetad
         .lastInstant()
         .map(instant -> {
           String ts = instant.requestedTime();
-          // Use the numeric portion of the instant timestamp as generation ID
-          try {
-            return String.valueOf(Long.parseLong(ts.replaceAll("[^0-9]", "")));
-          } catch (NumberFormatException e) {
-            return String.valueOf(ts.hashCode() & 0x7FFFFFFF);
-          }
+          // Keep generation ID bounded and key-compatible with fixed-width int metadata keys.
+          return String.valueOf(HoodieTableMetadataUtil.toVectorGenerationId(ts.replaceAll("[^0-9]", "")));
         })
-        .orElseGet(() -> String.valueOf(System.currentTimeMillis() / 1000L));
+        .orElseGet(() -> String.valueOf(HoodieTableMetadataUtil.toVectorGenerationId(
+            String.valueOf(System.currentTimeMillis()))));
   }
 
   protected SparkRDDMetadataWriteClient getSparkWriteClient(Option<BaseHoodieWriteClient<?, JavaRDD<HoodieRecord>, ?, JavaRDD<WriteStatus>>> writeClientOpt) {

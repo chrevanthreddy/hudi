@@ -31,13 +31,19 @@ import org.apache.spark.sql.types.StructType;
 
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
+import org.apache.spark.sql.types.ArrayType;
+import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.MetadataBuilder;
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 import static org.apache.hudi.common.util.ValidationUtils.checkArgument;
@@ -128,6 +134,71 @@ public final class VectorConversionUtils {
       }
     }
     return new StructType(newFields);
+  }
+
+  /**
+   * Builds the canonical {@code hoodie.vector.columns} footer value from Spark field metadata.
+   *
+   * <p>This is used by Lance writers, where the Spark schema already carries the Hudi
+   * {@code hudi_type=VECTOR(...)} annotation on vector fields.
+   */
+  public static String buildVectorColumnsFooterValue(StructType structType) {
+    if (structType == null) {
+      return "";
+    }
+
+    LinkedHashMap<String, HoodieSchema.Vector> vectorColumns = new LinkedHashMap<>();
+    for (StructField field : structType.fields()) {
+      if (!field.metadata().contains(HoodieSchema.TYPE_METADATA_FIELD)) {
+        continue;
+      }
+
+      HoodieSchema parsed = HoodieSchema.parseTypeDescriptor(
+          field.metadata().getString(HoodieSchema.TYPE_METADATA_FIELD));
+      if (parsed.getType() == HoodieSchemaType.VECTOR) {
+        vectorColumns.put(field.name(), (HoodieSchema.Vector) parsed);
+      }
+    }
+
+    return HoodieSchema.serializeVectorColumnsMetadata(vectorColumns);
+  }
+
+  /**
+   * Restores Hudi VECTOR metadata onto Spark fields after Arrow/Lance schema conversion.
+   *
+   * <p>The Arrow->Spark conversion preserves the fixed-size-list dimension in Spark field
+   * metadata, but drops the original Hudi {@code hudi_type=VECTOR(...)} annotation. This
+   * method reconstructs that annotation for the supplied vector column names.
+   */
+  public static StructType restoreVectorMetadata(StructType structType, Set<String> vectorColumnNames) {
+    if (structType == null || vectorColumnNames == null || vectorColumnNames.isEmpty()) {
+      return structType;
+    }
+
+    StructField[] fields = structType.fields();
+    StructField[] restored = new StructField[fields.length];
+    for (int i = 0; i < fields.length; i++) {
+      StructField field = fields[i];
+      if (!vectorColumnNames.contains(field.name())
+          || field.metadata().contains(HoodieSchema.TYPE_METADATA_FIELD)) {
+        restored[i] = field;
+        continue;
+      }
+
+      HoodieSchema.Vector vector = tryBuildVectorDescriptor(field);
+      if (vector == null) {
+        restored[i] = field;
+        continue;
+      }
+
+      Metadata enrichedMetadata = new MetadataBuilder()
+          .withMetadata(field.metadata())
+          .putString(HoodieSchema.TYPE_METADATA_FIELD, vector.toTypeDescriptor())
+          .build();
+      restored[i] = new StructField(field.name(), field.dataType(), field.nullable(), enrichedMetadata);
+    }
+
+    return new StructType(restored);
   }
 
   /**
@@ -381,5 +452,37 @@ public final class VectorConversionUtils {
         result.update(i, row.get(i, sourceSchema.apply(i).dataType()));
       }
     }
+  }
+
+  private static HoodieSchema.Vector tryBuildVectorDescriptor(StructField field) {
+    DataType dataType = field.dataType();
+    if (!(dataType instanceof ArrayType)) {
+      return null;
+    }
+
+    String fixedSizeListSizeKey = org.apache.spark.sql.util.LanceArrowUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY();
+    if (!field.metadata().contains(fixedSizeListSizeKey)) {
+      return null;
+    }
+
+    long dim = field.metadata().getLong(fixedSizeListSizeKey);
+    ArrayType arrayType = (ArrayType) dataType;
+    HoodieSchema.Vector.VectorElementType elementType = toVectorElementType(arrayType.elementType());
+    if (elementType == null) {
+      return null;
+    }
+
+    return HoodieSchema.createVector((int) dim, elementType);
+  }
+
+  private static HoodieSchema.Vector.VectorElementType toVectorElementType(DataType elementType) {
+    if (elementType.sameType(DataTypes.FloatType)) {
+      return HoodieSchema.Vector.VectorElementType.FLOAT;
+    } else if (elementType.sameType(DataTypes.DoubleType)) {
+      return HoodieSchema.Vector.VectorElementType.DOUBLE;
+    } else if (elementType.sameType(DataTypes.ByteType)) {
+      return HoodieSchema.Vector.VectorElementType.INT8;
+    }
+    return null;
   }
 }

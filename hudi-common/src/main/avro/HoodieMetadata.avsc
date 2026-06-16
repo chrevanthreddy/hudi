@@ -567,13 +567,19 @@
                         {
                             "name": "entryType",
                             "type": ["null", "string"],
-                            "doc": "Logical subtype inside the vector-index metadata family, for example ASSIGNMENT, FG_MAPPING, CENTROIDS, QUANTIZER, MANIFEST, or POSTING.",
+                            "doc": "Logical subtype inside the vector-index metadata family, for example CENTROIDS, QUANTIZER, MANIFEST, CLUSTER, or POSTING.",
                             "default": null
                         },
                         {
                             "name": "generationId",
                             "type": ["null", "string"],
                             "doc": "Active vector-index generation identifier used to version MDT-native vector postings.",
+                            "default": null
+                        },
+                        {
+                            "name": "recordKey",
+                            "type": ["null", "string"],
+                            "doc": "Logical Hudi record key stored explicitly in vector posting rows so query execution does not have to parse it from the MDT key.",
                             "default": null
                         },
                         {
@@ -610,6 +616,12 @@
                             "name": "partitionPath",
                             "type": ["null", "string"],
                             "doc": "Data-table partition path for assignment and fg_mapping records.",
+                            "default": null
+                        },
+                        {
+                            "name": "baseInstantTime",
+                            "type": ["null", "string"],
+                            "doc": "Base instant time of the Hudi file slice referenced by this vector posting row.",
                             "default": null
                         },
                         {

@@ -445,15 +445,6 @@ public abstract class BaseTableMetadata extends AbstractHoodieTableMetadata {
   protected abstract Option<HoodieMetadataPayload> readFilesIndexRecords(String key, String partitionName);
 
   /**
-   * Retrieves vector assignment records keyed by data-table record key (`A|record`).
-   */
-  public HoodiePairData<String, HoodieMetadataPayload> readVectorAssignmentIndexRecordsWithKeys(
-      HoodieData<String> recordKeys,
-      String partitionName) {
-    return readIndexRecordsWithKeys(recordKeys.map(VectorAssignmentRawKey::new), partitionName);
-  }
-
-  /**
    * Retrieves vector cluster records keyed by generation and cluster (`C|gen|cluster`).
    */
   public HoodiePairData<String, HoodieMetadataPayload> readVectorClusterIndexRecordsWithKeys(

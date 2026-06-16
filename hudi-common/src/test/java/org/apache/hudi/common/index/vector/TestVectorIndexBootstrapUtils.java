@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class TestVectorIndexBootstrapUtils {
 
   @Test
-  void testBootstrapProducesCentroidAndAssignmentRecords() {
+  void testBootstrapProducesCentroidAndPostingRecords() {
     Map<String, String> options = new HashMap<>();
     options.put(VectorIndexOptions.DIMENSION, "2");
     options.put(VectorIndexOptions.NUM_CLUSTERS, "2");
@@ -76,6 +76,11 @@ class TestVectorIndexBootstrapUtils {
     assertNotNull(centroidPayload.getVectorIndexMetadata().get().getCentroidBytes());
     assertEquals(2 * 2 * Float.BYTES, centroidPayload.getVectorIndexMetadata().get().getCentroidBytes().remaining());
 
+    HoodieMetadataPayload postingPayload = recordsByKey.get(HoodieTableMetadataUtil.getVectorIndexPostingKey(0, result.getAssignments().get("rk-1"), 0, "rk-1"));
+    assertNotNull(postingPayload);
+    assertEquals(HoodieMetadataPayload.VECTOR_INDEX_ENTRY_TYPE_POSTING, postingPayload.getVectorIndexMetadata().get().getEntryType());
+    assertEquals("rk-1", postingPayload.getVectorIndexMetadata().get().getRecordKey());
+
     VectorIndexPruner pruner = new VectorIndexPruner(result.getCentroids(), clusterToFileGroups(result.getAssignments()), VectorDistanceMetric.L2);
     assertArrayEquals(new int[] {result.getAssignments().get("rk-1")}, pruner.findTopClusters(new float[] {0.05f, 0.05f}, 1));
   }
@@ -109,6 +114,16 @@ class TestVectorIndexBootstrapUtils {
 
     options.put(VectorIndexOptions.RABITQ_MATERIALIZE_ON_CREATE, "true");
     assertTrue(VectorIndexOptions.shouldMaterializeRaBitQColumnsOnCreate(options));
+  }
+
+  @Test
+  void testRaBitQStorageDefaultsToBothAndEnablesMdtPostings() {
+    Map<String, String> options = new HashMap<>();
+    assertEquals("both", VectorIndexOptions.getRaBitQStorage(options));
+    assertTrue(VectorIndexOptions.shouldStoreRaBitQCodesInMdt(options));
+
+    options.put(VectorIndexOptions.RABITQ_STORAGE, "hidden_columns");
+    assertTrue(!VectorIndexOptions.shouldStoreRaBitQCodesInMdt(options));
   }
 
   private static Map<Integer, java.util.Set<String>> clusterToFileGroups(Map<String, Integer> assignments) {

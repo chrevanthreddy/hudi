@@ -1139,6 +1139,28 @@ class TestHoodieVectorSearchFunction extends HoodieSparkClientTestBase {
   }
 
   @Test
+  def testIvfRaBitQMdtAlgorithmRequiresHudiTable(): Unit = {
+    val ex = assertThrows(classOf[Exception], () => {
+      spark.sql(
+        s"""
+           |SELECT *
+           |FROM hudi_vector_search(
+           |  '$corpusViewName',
+           |  'embedding',
+           |  ARRAY(1.0, 0.0, 0.0),
+           |  2,
+           |  'cosine',
+           |  'ivf_rabitq_mdt'
+           |)
+           |""".stripMargin
+      ).collect()
+    })
+
+    assertTrue(ex.getMessage.contains("requires a Hudi table identifier or table path") ||
+      (ex.getCause != null && ex.getCause.getMessage.contains("requires a Hudi table identifier or table path")))
+  }
+
+  @Test
   def testCosineDistanceAntiparallelVectors(): Unit = {
     // [1,0,0] vs [-1,0,0] are exactly antiparallel; cosine distance should be 2.0.
     // FP rounding can push dot/denom slightly below -1.0, making 1 - x > 2.0.

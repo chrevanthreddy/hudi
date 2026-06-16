@@ -208,13 +208,13 @@ public class SparkValidatorUtils {
             + "defaulting to inferring schema from data files", e));
         return sqlContext
             .read()
-            .parquet(JavaScalaConverters.convertJavaListToScalaSeq(baseFilePaths));
+            .parquet(JavaScalaConverters.convertJavaListToScalaList(baseFilePaths));
       }
     }
     return sqlContext
         .read()
         .schema(HoodieSchemaConversionUtils.convertHoodieSchemaToStructType(readerSchema))
-        .parquet(JavaScalaConverters.convertJavaListToScalaSeq(baseFilePaths));
+        .parquet(JavaScalaConverters.convertJavaListToScalaList(baseFilePaths));
   }
 
   /**

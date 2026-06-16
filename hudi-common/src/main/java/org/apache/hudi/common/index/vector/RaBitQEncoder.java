@@ -19,7 +19,10 @@
 
 package org.apache.hudi.common.index.vector;
 
+import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * RaBitQ (Randomized Binary Quantization) encoder.
@@ -53,6 +56,7 @@ import java.util.Random;
 public final class RaBitQEncoder implements VectorQuantizer {
 
   private static final long serialVersionUID = 1L;
+  private static final Map<RotationKey, float[][]> ROTATION_MATRIX_CACHE = new ConcurrentHashMap<>();
 
   private final int dimension;
   private final long seed;
@@ -107,11 +111,19 @@ public final class RaBitQEncoder implements VectorQuantizer {
   @Override
   public float estimateDistance(QueryState queryState, QuantizedVector encoded) {
     RaBitQQueryState qs = (RaBitQQueryState) queryState;
-    int hamming = hammingDistance(qs.binaryCode, encoded.code);
+    return estimateDistance(qs.binaryCode, encoded.code, encoded.scalar, dimension);
+  }
+
+  public float estimateDistance(byte[] queryBinaryCode, byte[] encodedCode, float scalar) {
+    return estimateDistance(queryBinaryCode, encodedCode, scalar, dimension);
+  }
+
+  public static float estimateDistance(byte[] queryBinaryCode, byte[] encodedCode, float scalar, int dimension) {
+    int hamming = hammingDistance(queryBinaryCode, encodedCode);
     // cosine_sim ≈ 1 - 2 * hamming / D  (valid for random orthogonal R)
     float cosineSim = 1.0f - 2.0f * hamming / dimension;
     // Distance = 1 - cosine_sim; scaled by scalar for unnormalized vectors
-    return encoded.scalar * (1.0f - cosineSim);
+    return scalar * (1.0f - cosineSim);
   }
 
   @Override
@@ -183,11 +195,16 @@ public final class RaBitQEncoder implements VectorQuantizer {
     if (rotMat == null) {
       synchronized (this) {
         if (rotMat == null) {
-          rotMat = buildRotationMatrix(dimension, seed);
+          rotMat = getOrBuildRotationMatrix(dimension, seed);
         }
       }
     }
     return rotMat;
+  }
+
+  private static float[][] getOrBuildRotationMatrix(int dimension, long seed) {
+    return ROTATION_MATRIX_CACHE.computeIfAbsent(new RotationKey(dimension, seed),
+        key -> buildRotationMatrix(key.dimension, key.seed));
   }
 
   /**
@@ -250,6 +267,33 @@ public final class RaBitQEncoder implements VectorQuantizer {
     public RaBitQQueryState(byte[] binaryCode, float[] rotatedQuery) {
       this.binaryCode    = binaryCode;
       this.rotatedQuery  = rotatedQuery;
+    }
+  }
+
+  private static final class RotationKey {
+    private final int dimension;
+    private final long seed;
+
+    private RotationKey(int dimension, long seed) {
+      this.dimension = dimension;
+      this.seed = seed;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+      if (other == null || getClass() != other.getClass()) {
+        return false;
+      }
+      RotationKey that = (RotationKey) other;
+      return dimension == that.dimension && seed == that.seed;
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(dimension, seed);
     }
   }
 }
