@@ -102,3 +102,4 @@ CLAUDE.md
 # Python virtual environments
 #######################################
 .venv/
+.github/instructions/wmt-copilot.instructions.md

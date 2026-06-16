@@ -61,7 +61,7 @@ import scala.collection.JavaConverters._
  * @param filters           spark filters that might be pushed down into the reader
  * @param requiredFilters   filters that are required and should always be used, even in merging situations
  */
-class SparkFileFormatInternalRowReaderContext(baseFileReader: SparkColumnarFileReader,
+class SparkFileFormatInternalRowReaderContext(val baseFileReader: SparkColumnarFileReader,
                                               filters: Seq[Filter],
                                               requiredFilters: Seq[Filter],
                                               storageConfiguration: StorageConfiguration[_],

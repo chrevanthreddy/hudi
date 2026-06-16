@@ -115,6 +115,14 @@ public class SparkReaderContextFactory implements ReaderContextFactory<InternalR
 
   @Override
   public HoodieReaderContext<InternalRow> getContext() {
+    return getContext(Collections.emptyList(), Collections.emptyList());
+  }
+
+  public HoodieReaderContext<InternalRow> getContext(List<Filter> filters) {
+    return getContext(filters, Collections.emptyList());
+  }
+
+  public HoodieReaderContext<InternalRow> getContext(List<Filter> filters, List<Filter> requiredFilters) {
     if (baseFileReaderBroadcast == null) {
       throw new HoodieException("Spark Parquet reader broadcast is not initialized.");
     }
@@ -129,11 +137,10 @@ public class SparkReaderContextFactory implements ReaderContextFactory<InternalR
 
     SparkColumnarFileReader baseFileReader = baseFileReaderBroadcast.getValue();
     if (baseFileReader != null) {
-      List<Filter> filters = Collections.emptyList();
       return new SparkFileFormatInternalRowReaderContext(
           baseFileReader,
           JavaConverters.asScalaBufferConverter(filters).asScala().toSeq(),
-          JavaConverters.asScalaBufferConverter(filters).asScala().toSeq(),
+          JavaConverters.asScalaBufferConverter(requiredFilters).asScala().toSeq(),
           new HadoopStorageConfiguration(configurationBroadcast.getValue().value()),
           tableConfigBroadcast.getValue());
     } else {

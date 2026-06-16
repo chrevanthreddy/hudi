@@ -101,7 +101,13 @@ class TestSparkVectorIndexBootstrap extends SparkClientFunctionalTestHarness {
           .collect(Collectors.toList());
 
       assertTrue(recordKeys.size() >= 4, "Generated vector index keys: " + recordKeys);
-      assertTrue(recordKeys.containsAll(Arrays.asList("id1", "id2", "id3", "id4")),
+      assertTrue(recordKeys.contains(HoodieTableMetadataUtil.VECTOR_INDEX_CENTROIDS_KEY),
+          "Generated vector index keys: " + recordKeys);
+      assertTrue(recordKeys.contains(HoodieTableMetadataUtil.VECTOR_INDEX_QUANTIZER_KEY),
+          "Generated vector index keys: " + recordKeys);
+      assertTrue(recordKeys.stream().anyMatch(key -> key.startsWith(HoodieTableMetadataUtil.VECTOR_INDEX_CLUSTER_KEY_PREFIX)),
+          "Generated vector index keys: " + recordKeys);
+      assertTrue(recordKeys.stream().anyMatch(key -> key.startsWith(HoodieTableMetadataUtil.VECTOR_INDEX_POSTING_KEY_PREFIX)),
           "Generated vector index keys: " + recordKeys);
     }
   }

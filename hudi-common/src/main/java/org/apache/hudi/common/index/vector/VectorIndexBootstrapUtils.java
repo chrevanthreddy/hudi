@@ -44,6 +44,47 @@ public final class VectorIndexBootstrapUtils {
   private VectorIndexBootstrapUtils() {
   }
 
+  /**
+   * Train KMeans centroids from a sample of vectors.
+   *
+   * <p>This is the engine-agnostic centroid training entry point. At scale, callers
+   * should sample ~256*K to 1024*K vectors from the full dataset and pass only the
+   * sample here. Training on more provides negligible recall improvement for IVF.
+   *
+   * @param sampleVectors sampled vectors as double arrays (each of length {@code dimension})
+   * @param options       vector index options (dimension, num_clusters, max_iter, metric)
+   * @return trained centroids as double[K][dimension]
+   */
+  public static double[][] trainCentroids(List<double[]> sampleVectors, Map<String, String> options) {
+    checkArgument(sampleVectors != null && !sampleVectors.isEmpty(),
+        "At least one sample vector is required for centroid training");
+    int dimension = VectorIndexOptions.getDimension(options);
+    int requestedClusters = Math.max(1, VectorIndexOptions.getNumClusters(options));
+    int numClusters = Math.min(requestedClusters, sampleVectors.size());
+    int maxIter = Math.max(1, VectorIndexOptions.getMaxIter(options));
+    VectorDistanceMetric metric = VectorIndexOptions.getMetric(options);
+
+    for (int i = 0; i < sampleVectors.size(); i++) {
+      checkArgument(sampleVectors.get(i).length == dimension,
+          String.format("Sample vector %d has dimension %d, expected %d", i, sampleVectors.get(i).length, dimension));
+    }
+
+    double[][] centroids = initializeCentroidsFromVectors(sampleVectors, numClusters, dimension);
+    int[] assignments = new int[sampleVectors.size()];
+    for (int i = 0; i < assignments.length; i++) {
+      assignments[i] = -1;
+    }
+
+    for (int iteration = 0; iteration < maxIter; iteration++) {
+      boolean changed = assignVectorsToClosestCentroids(sampleVectors, centroids, assignments, metric);
+      centroids = recomputeCentroidsFromVectors(sampleVectors, assignments, centroids, dimension);
+      if (!changed) {
+        break;
+      }
+    }
+    return centroids;
+  }
+
   public static BootstrapResult buildBootstrapResult(List<VectorDocument> documents,
                                                      String partitionPath,
                                                      Map<String, String> options,
@@ -51,26 +92,19 @@ public final class VectorIndexBootstrapUtils {
     checkArgument(documents != null && !documents.isEmpty(), "Vector index bootstrap requires at least one vector");
 
     int dimension = VectorIndexOptions.getDimension(options);
-    int requestedClusters = Math.max(1, VectorIndexOptions.getNumClusters(options));
-    int numClusters = Math.min(requestedClusters, documents.size());
-    int maxIter = Math.max(1, VectorIndexOptions.getMaxIter(options));
     VectorDistanceMetric metric = VectorIndexOptions.getMetric(options);
 
     validateDocuments(documents, dimension);
 
-    double[][] centroids = initializeCentroids(documents, numClusters, dimension);
-    int[] assignments = new int[documents.size()];
-    for (int i = 0; i < assignments.length; i++) {
-      assignments[i] = -1;
+    List<double[]> rawVectors = new ArrayList<>(documents.size());
+    for (VectorDocument doc : documents) {
+      rawVectors.add(doc.getVector());
     }
+    double[][] centroids = trainCentroids(rawVectors, options);
 
-    for (int iteration = 0; iteration < maxIter; iteration++) {
-      boolean changed = assignToClosestCentroids(documents, centroids, assignments, metric);
-      double[][] nextCentroids = recomputeCentroids(documents, assignments, centroids, dimension);
-      centroids = nextCentroids;
-      if (!changed) {
-        break;
-      }
+    int[] assignments = new int[documents.size()];
+    for (int i = 0; i < documents.size(); i++) {
+      assignments[i] = findClosestCentroid(documents.get(i).getVector(), centroids, metric);
     }
 
     List<HoodieRecord> records = new ArrayList<>(documents.size() + 1);
@@ -81,7 +115,17 @@ public final class VectorIndexBootstrapUtils {
       VectorDocument document = documents.get(i);
       int clusterId = assignments[i];
       assignmentMap.put(document.getRecordKey(), clusterId);
-      records.add(HoodieMetadataPayload.createVectorIndexAssignmentRecord(document.getRecordKey(), clusterId, partitionPath));
+      records.add(HoodieMetadataPayload.createVectorIndexPostingRecord(
+          "0",
+          document.getRecordKey(),
+          clusterId,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0L,
+          partitionPath));
     }
 
     return new BootstrapResult(toFloatCentroids(centroids), assignmentMap, records);
@@ -105,23 +149,22 @@ public final class VectorIndexBootstrapUtils {
     });
   }
 
-  private static double[][] initializeCentroids(List<VectorDocument> documents, int numClusters, int dimension) {
+  private static double[][] initializeCentroidsFromVectors(List<double[]> vectors, int numClusters, int dimension) {
     double[][] centroids = new double[numClusters][dimension];
     for (int clusterId = 0; clusterId < numClusters; clusterId++) {
-      int sourceIndex = (int) (((long) clusterId * documents.size()) / numClusters);
-      System.arraycopy(documents.get(sourceIndex).getVector(), 0, centroids[clusterId], 0, dimension);
+      int sourceIndex = (int) (((long) clusterId * vectors.size()) / numClusters);
+      System.arraycopy(vectors.get(sourceIndex), 0, centroids[clusterId], 0, dimension);
     }
     return centroids;
   }
 
-  private static boolean assignToClosestCentroids(List<VectorDocument> documents,
-                                                  double[][] centroids,
-                                                  int[] assignments,
-                                                  VectorDistanceMetric metric) {
+  private static boolean assignVectorsToClosestCentroids(List<double[]> vectors,
+                                                         double[][] centroids,
+                                                         int[] assignments,
+                                                         VectorDistanceMetric metric) {
     boolean changed = false;
-    for (int i = 0; i < documents.size(); i++) {
-      double[] vector = documents.get(i).getVector();
-      int bestCluster = findClosestCentroid(vector, centroids, metric);
+    for (int i = 0; i < vectors.size(); i++) {
+      int bestCluster = findClosestCentroid(vectors.get(i), centroids, metric);
       if (assignments[i] != bestCluster) {
         assignments[i] = bestCluster;
         changed = true;
@@ -130,17 +173,17 @@ public final class VectorIndexBootstrapUtils {
     return changed;
   }
 
-  private static double[][] recomputeCentroids(List<VectorDocument> documents,
-                                              int[] assignments,
-                                              double[][] previousCentroids,
-                                              int dimension) {
+  private static double[][] recomputeCentroidsFromVectors(List<double[]> vectors,
+                                                          int[] assignments,
+                                                          double[][] previousCentroids,
+                                                          int dimension) {
     double[][] sums = new double[previousCentroids.length][dimension];
     int[] counts = new int[previousCentroids.length];
 
-    for (int i = 0; i < documents.size(); i++) {
+    for (int i = 0; i < vectors.size(); i++) {
       int clusterId = assignments[i];
       counts[clusterId]++;
-      double[] vector = documents.get(i).getVector();
+      double[] vector = vectors.get(i);
       for (int dimensionIndex = 0; dimensionIndex < dimension; dimensionIndex++) {
         sums[clusterId][dimensionIndex] += vector[dimensionIndex];
       }

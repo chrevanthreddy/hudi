@@ -26,7 +26,6 @@ import org.apache.hudi.common.model.HoodieRecordGlobalLocation;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.metadata.HoodieMetadataPayload;
 import org.apache.hudi.metadata.HoodieTableMetadata;
-import org.apache.hudi.metadata.HoodieTableMetadataUtil;
 import org.apache.hudi.metadata.VectorPostingPrefixRawKey;
 
 import org.junit.jupiter.api.Test;
@@ -83,7 +82,7 @@ class TestVectorIndexMdtSearchUtils {
     HoodieTableMetadata metadataTable = mock(HoodieTableMetadata.class);
     String indexPartition = "vector_index_embedding_idx";
     HoodieRecord<HoodieMetadataPayload> postingRecord = HoodieMetadataPayload.createVectorIndexPostingRecord(
-        "7", "doc_42", 3, 1, "fg-9", "p=2026", new byte[] {0x0F}, 2.0f, 123L, indexPartition);
+        "7", "doc_42", 3, 1, "fg-9", "p=2026", "001", new byte[] {0x0F}, 2.0f, 123L, indexPartition);
     when(metadataTable.getRecordsByKeyPrefixes(any(), eq(indexPartition), eq(false)))
         .thenReturn(HoodieListData.eager(Collections.singletonList(postingRecord)));
 
@@ -100,7 +99,38 @@ class TestVectorIndexMdtSearchUtils {
     assertEquals("doc_42", results.get(0).getRecordKey());
     assertEquals(1, results.get(0).getShardId());
     assertEquals("fg-9", results.get(0).getFileGroupId());
+    assertEquals("001", results.get(0).getBaseInstantTime());
     assertNotNull(results.get(0).getBinaryCode());
+  }
+
+  @Test
+  void testCollectClusterToFileGroupsUsesPostingRowsAndPartitionFilter() {
+    HoodieTableMetadata metadataTable = mock(HoodieTableMetadata.class);
+    String indexPartition = "vector_index_embedding_idx";
+    List<HoodieRecord<HoodieMetadataPayload>> postingRecords = Arrays.asList(
+        HoodieMetadataPayload.createVectorIndexPostingRecord(
+            "7", "doc_1", 3, 0, "fg-1", "p=2026", "001", new byte[] {0x01}, 1.0f, 123L, indexPartition),
+        HoodieMetadataPayload.createVectorIndexPostingRecord(
+            "7", "doc_2", 3, 1, "fg-2", "p=2027", "002", new byte[] {0x02}, 1.0f, 123L, indexPartition),
+        HoodieMetadataPayload.createVectorIndexPostingRecord(
+            "7", "doc_3", 9, 0, "fg-9", "p=2026", "003", new byte[] {0x03}, 1.0f, 123L, indexPartition));
+    when(metadataTable.getRecordsByKeyPrefixes(any(), eq(indexPartition), eq(true)))
+        .thenReturn(HoodieListData.eager(postingRecords));
+
+    Map<Integer, Integer> shardCounts = new HashMap<>();
+    shardCounts.put(3, 2);
+    shardCounts.put(9, 1);
+
+    Map<Integer, java.util.Set<String>> clusterToFileGroups = VectorIndexMdtSearchUtils.collectClusterToFileGroups(
+        metadataTable,
+        indexPartition,
+        7,
+        shardCounts,
+        Collections.singleton("p=2026"),
+        true);
+
+    assertEquals(Collections.singleton("fg-1"), clusterToFileGroups.get(3));
+    assertEquals(Collections.singleton("fg-9"), clusterToFileGroups.get(9));
   }
 
   @Test
@@ -110,8 +140,8 @@ class TestVectorIndexMdtSearchUtils {
     VectorQuantizer.QuantizedVector far = encoder.encode(new float[] {-1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f});
 
     HoodieListData<VectorIndexMdtSearchUtils.PostingMatch> postings = HoodieListData.eager(Arrays.asList(
-        new VectorIndexMdtSearchUtils.PostingMatch("rk-near", 0, 0, "fg-1", "p1", near.code, near.scalar),
-        new VectorIndexMdtSearchUtils.PostingMatch("rk-far", 0, 0, "fg-2", "p1", far.code, far.scalar)));
+        new VectorIndexMdtSearchUtils.PostingMatch("rk-near", 0, 0, "fg-1", "p1", "001", near.code, near.scalar),
+        new VectorIndexMdtSearchUtils.PostingMatch("rk-far", 0, 0, "fg-2", "p1", "001", far.code, far.scalar)));
 
     HoodieTableMetadata metadataTable = mock(HoodieTableMetadata.class);
     when(metadataTable.readRecordIndexLocationsWithKeys(any())).thenReturn(HoodieListPairData.eager(Arrays.asList(
@@ -133,9 +163,23 @@ class TestVectorIndexMdtSearchUtils {
   }
 
   @Test
-  void testPostingRecordKeyExtractionHelper() {
-    String postingKey = HoodieTableMetadataUtil.getVectorIndexPostingKey(7, 3, 2, "doc_987654");
-    assertEquals("doc_987654", HoodieTableMetadataUtil.getVectorIndexPostingRecordKey(postingKey));
-    assertEquals(null, HoodieTableMetadataUtil.getVectorIndexPostingRecordKey("not-a-posting-key"));
+  void testReadPostingMatchesRequiresCanonicalRecordKeyInPayload() {
+    HoodieTableMetadata metadataTable = mock(HoodieTableMetadata.class);
+    String indexPartition = "vector_index_embedding_idx";
+    HoodieRecord<HoodieMetadataPayload> postingRecord = HoodieMetadataPayload.createVectorIndexPostingRecord(
+        "7", "doc_42", 3, 1, "fg-9", "p=2026", "001", new byte[] {0x0F}, 2.0f, 123L, indexPartition);
+    postingRecord.getData().getVectorIndexMetadata().get().setRecordKey(null);
+    when(metadataTable.getRecordsByKeyPrefixes(any(), eq(indexPartition), eq(false)))
+        .thenReturn(HoodieListData.eager(Collections.singletonList(postingRecord)));
+
+    HoodieListData<VectorIndexMdtSearchUtils.PostingMatch> matches =
+        (HoodieListData<VectorIndexMdtSearchUtils.PostingMatch>) VectorIndexMdtSearchUtils.readPostingMatches(
+            metadataTable,
+            indexPartition,
+            7,
+            Collections.singletonMap(3, 2),
+            false);
+
+    assertTrue(matches.collectAsList().isEmpty());
   }
 }

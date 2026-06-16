@@ -266,12 +266,14 @@ public enum MetadataPartitionType {
       payload.vectorIndexMetadata = new org.apache.hudi.avro.model.HoodieVectorIndexInfo(
           (String) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_ENTRY_TYPE),
           (String) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_GENERATION_ID),
+          (String) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_RECORD_KEY),
           (Integer) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_SHARD_ID),
           (Integer) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_SHARD_COUNT),
           (Integer) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_CLUSTER_ID),
           (java.nio.ByteBuffer) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_CENTROID_BYTES),
           (String) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_FILE_GROUP_ID),
           (String) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_PARTITION_PATH),
+          (String) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_BASE_INSTANT_TIME),
           (java.util.List<String>) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_FILE_GROUP_IDS),
           (Long) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_VECTOR_COUNT),
           (Long) vectorIndexRecord.get(HoodieMetadataPayload.VECTOR_INDEX_FIELD_LAST_UPDATED_TS),
@@ -290,6 +292,11 @@ public enum MetadataPartitionType {
       return metaClient.getIndexForMetadataPartition(indexName)
           .map(HoodieIndexDefinition::getIndexName)
           .orElseThrow(() -> new IllegalArgumentException("Index definition is not present for index: " + indexName));
+    }
+
+    @Override
+    public SerializableBiFunction<String, Integer, Integer> getFileGroupMappingFunction(HoodieIndexVersion indexVersion) {
+      return HoodieTableMetadataUtil::mapVectorPostingKeyToFileGroupIndex;
     }
   },
   PARTITION_STATS(HoodieTableMetadataUtil.PARTITION_NAME_PARTITION_STATS, "partition-stats-", 6) {

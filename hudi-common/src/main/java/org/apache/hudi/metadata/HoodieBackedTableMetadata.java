@@ -81,6 +81,7 @@ import org.apache.hudi.util.PartitionPathFilterUtil;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -235,15 +236,24 @@ public class HoodieBackedTableMetadata extends BaseTableMetadata {
     // Sort must come after encoding.
     Collections.sort(sortedKeyPrefixes);
 
-    // NOTE: Since we partition records to a particular file-group by full key, we will have
-    //       to scan all file-groups for all key-prefixes as each of these might contain some
-    //       records matching the key-prefix
     List<FileSlice> partitionFileSlices = partitionFileSliceMap.computeIfAbsent(partitionName,
         k -> HoodieTableMetadataUtil.getPartitionLatestMergedFileSlices(metadataMetaClient, getMetadataFileSystemView(), partitionName));
     checkState(!partitionFileSlices.isEmpty(), () -> "Number of file slices for partition " + partitionName + " should be > 0");
 
-    return (shouldLoadInMemory ? HoodieListData.lazy(partitionFileSlices) :
-        getEngineContext().parallelize(partitionFileSlices))
+    List<FileSlice> targetFileSlices = getTargetFileSlicesForKeyPrefixLookup(partitionName, sortedKeyPrefixes, partitionFileSlices);
+    if (sortedKeyPrefixes.stream().allMatch(HoodieTableMetadataUtil::isVectorIndexPostingKey)) {
+      LOG.info("Vector MDT prefix lookup: partition={}, prefixCount={}, totalFileSlices={}, targetFileSlices={}, shouldLoadInMemory={}, "
+              + "targetFileIds={}, prefixes={}",
+          partitionName,
+          sortedKeyPrefixes.size(),
+          partitionFileSlices.size(),
+          targetFileSlices.size(),
+          shouldLoadInMemory,
+          targetFileSlices.stream().map(FileSlice::getFileId).collect(Collectors.toList()),
+          sortedKeyPrefixes);
+    }
+    return (shouldLoadInMemory ? HoodieListData.lazy(targetFileSlices) :
+        getEngineContext().parallelize(targetFileSlices))
         .flatMap(
             (SerializableFunction<FileSlice, Iterator<HoodieRecord<HoodieMetadataPayload>>>) fileSlice ->
                 readSliceAndFilterByKeysIntoList(partitionName, sortedKeyPrefixes, fileSlice,
@@ -254,6 +264,35 @@ public class HoodieBackedTableMetadata extends BaseTableMetadata {
                       return new HoodieAvroRecord<>(key, payload);
                     }, false))
         .filter(r -> !r.getData().isDeleted());
+  }
+
+  private List<FileSlice> getTargetFileSlicesForKeyPrefixLookup(String partitionName,
+                                                                List<String> sortedKeyPrefixes,
+                                                                List<FileSlice> partitionFileSlices) {
+    if (partitionFileSlices.size() <= 1 || sortedKeyPrefixes.isEmpty()) {
+      return partitionFileSlices;
+    }
+    // Vector posting prefixes can be routed to specific file groups because the write
+    // path (MetadataPartitionType.VECTOR_INDEX.getFileGroupMappingFunction) hashes by
+    // the cluster prefix P|gen|cluster|. Read-time lookups may still use shard prefixes,
+    // but those collapse to the same routing key for file-slice pruning.
+    if (sortedKeyPrefixes.stream().allMatch(HoodieTableMetadataUtil::isVectorIndexPostingKey)) {
+      int numFileGroups = partitionFileSlices.size();
+      Set<Integer> targetIndices = new HashSet<>();
+      for (String prefix : sortedKeyPrefixes) {
+        targetIndices.add(HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(prefix, numFileGroups));
+      }
+      if (targetIndices.size() < numFileGroups) {
+        List<FileSlice> pruned = new ArrayList<>(targetIndices.size());
+        for (int i = 0; i < numFileGroups; i++) {
+          if (targetIndices.contains(i)) {
+            pruned.add(partitionFileSlices.get(i));
+          }
+        }
+        return pruned;
+      }
+    }
+    return partitionFileSlices;
   }
 
   private static TreeSet<String> getDistinctSortedKeysForSingleSlice(HoodieData<String> keys) {

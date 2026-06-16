@@ -109,6 +109,7 @@ object HoodieProcedures {
       ,(ShowAuditLockStatusProcedure.NAME, ShowAuditLockStatusProcedure.builder)
       ,(ValidateAuditLockProcedure.NAME, ValidateAuditLockProcedure.builder)
       ,(CleanupAuditLockProcedure.NAME, CleanupAuditLockProcedure.builder)
+      ,(VectorMdtProbeProcedure.NAME, VectorMdtProbeProcedure.builder)
     )
   }
 }

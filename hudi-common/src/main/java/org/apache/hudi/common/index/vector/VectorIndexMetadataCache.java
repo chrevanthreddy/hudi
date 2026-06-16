@@ -249,12 +249,6 @@ public final class VectorIndexMetadataCache implements Serializable {
       dimension = 0;
     }
 
-    // If no cluster manifests from C| records, fall back to legacy __fg__/ rows
-    // only for callers that explicitly asked for cluster/file-group metadata.
-    if (shouldLoadClusterManifests && clusterManifests.isEmpty()) {
-      clusterManifests = loadLegacyFgMappings(metadataTable, indexPartition);
-    }
-
     return new VectorIndexMetadataCache(
         centroids,
         generationId,
@@ -419,47 +413,6 @@ public final class VectorIndexMetadataCache implements Serializable {
     return result;
   }
 
-  /**
-   * Falls back to legacy __fg__/ prefix scan when cluster manifests are unavailable.
-   */
-  private static Map<Integer, ClusterManifest> loadLegacyFgMappings(HoodieTableMetadata metadataTable,
-                                                                     String indexPartition) {
-    List<RawKey> fgKeys = Collections.singletonList(
-        simpleKey(HoodieTableMetadataUtil.VECTOR_INDEX_FG_MAPPING_KEY_PREFIX));
-
-    List<HoodieRecord<HoodieMetadataPayload>> fgRecords = metadataTable
-        .getRecordsByKeyPrefixes(HoodieListData.eager(fgKeys), indexPartition, true)
-        .collectAsList();
-
-    Map<Integer, Set<String>> clusterFileGroups = new HashMap<>();
-    Map<Integer, Long> clusterVectorCounts = new HashMap<>();
-
-    for (HoodieRecord<HoodieMetadataPayload> record : fgRecords) {
-      HoodieVectorIndexInfo info = extractVectorInfo(record);
-      if (info == null) {
-        continue;
-      }
-      int clusterId = info.getClusterId();
-      if (info.getFileGroupIds() != null) {
-        clusterFileGroups
-            .computeIfAbsent(clusterId, k -> new HashSet<>())
-            .addAll(info.getFileGroupIds());
-      }
-      clusterVectorCounts.merge(clusterId, info.getVectorCount(), Long::sum);
-    }
-
-    Map<Integer, ClusterManifest> result = new HashMap<>();
-    for (Map.Entry<Integer, Set<String>> entry : clusterFileGroups.entrySet()) {
-      int clusterId = entry.getKey();
-      result.put(clusterId, new ClusterManifest(
-          clusterId,
-          1,  // legacy rows don't have shard counts
-          entry.getValue(),
-          clusterVectorCounts.getOrDefault(clusterId, 0L)));
-    }
-    return result;
-  }
-
   private static RawKey simpleKey(String key) {
     return new RawKey() {
       @Override
@@ -468,4 +421,5 @@ public final class VectorIndexMetadataCache implements Serializable {
       }
     };
   }
+
 }

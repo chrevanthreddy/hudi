@@ -102,7 +102,8 @@ class ITVectorIndexGcs {
 
     // Vector-index MDT payload factories (metadata table write path is separate; this checks Avro wiring)
     val part = HoodieTableMetadataUtil.PARTITION_NAME_VECTOR_INDEX_PREFIX + "it"
-    val rec = HoodieMetadataPayload.createVectorIndexAssignmentRecord("rk1", 3, part)
+    val rec = HoodieMetadataPayload.createVectorIndexPostingRecord(
+      "7", "rk1", 3, 0, "file-1", "default", "001", Array[Byte](1, 2), 1.5f, System.currentTimeMillis(), part)
     Assertions.assertTrue(rec.getData.getVectorIndexMetadata.isPresent)
     Assertions.assertEquals(3, rec.getData.getVectorIndexMetadata.get().getClusterId)
     val buf = ByteBuffer.allocate(dim * java.lang.Float.BYTES)
@@ -132,12 +133,14 @@ class ITVectorIndexGcs {
     Assertions.assertEquals(Seq("file-1", "file-2"), clusterManifest.getData.getVectorIndexMetadata.get().getFileGroupIds)
 
     val posting = HoodieMetadataPayload.createVectorIndexPostingRecord(
-      "7", "rk1", 3, 2, "file-1", "default", Array[Byte](1, 2), 1.5f, System.currentTimeMillis(), part)
+      "7", "rk1", 3, 2, "file-1", "default", "001", Array[Byte](1, 2), 1.5f, System.currentTimeMillis(), part)
     Assertions.assertEquals(
       HoodieMetadataPayload.VECTOR_INDEX_ENTRY_TYPE_POSTING,
       posting.getData.getVectorIndexMetadata.get().getEntryType)
-    Assertions.assertEquals("gen-1", posting.getData.getVectorIndexMetadata.get().getGenerationId)
+    Assertions.assertEquals("7", posting.getData.getVectorIndexMetadata.get().getGenerationId)
+    Assertions.assertEquals("rk1", posting.getData.getVectorIndexMetadata.get().getRecordKey)
     Assertions.assertEquals(2, posting.getData.getVectorIndexMetadata.get().getShardId)
+    Assertions.assertEquals("001", posting.getData.getVectorIndexMetadata.get().getBaseInstantTime)
     Assertions.assertNotNull(posting.getData.getVectorIndexMetadata.get().getBinaryCode)
     Assertions.assertEquals(1.5f, posting.getData.getVectorIndexMetadata.get().getScalar)
     Assertions.assertTrue(

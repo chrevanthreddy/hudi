@@ -355,7 +355,6 @@ class TestHoodieTableMetadataUtil {
 
   @Test
   void testVectorIndexRawKeysAndPostingPrefixes() {
-    assertEquals("A|doc_987654", new VectorAssignmentRawKey("doc_987654").encode());
     assertEquals("C|00000007|00001842", new VectorClusterRawKey(7, 0x1842).encode());
     assertEquals("M|00000007", new VectorGenerationManifestRawKey(7).encode());
 
@@ -368,5 +367,22 @@ class TestHoodieTableMetadataUtil {
         new VectorPostingPrefixRawKey(7, 0x1842, 3).encode());
     assertEquals("P|00000007|00001842|",
         new VectorPostingPrefixRawKey(7, 0x1842, null).encode());
+  }
+
+  @Test
+  void testVectorPostingRoutingUsesClusterPrefix() {
+    String clusterPrefix = HoodieTableMetadataUtil.getVectorIndexPostingPrefix(7, 0x1842);
+    String shardPrefix = HoodieTableMetadataUtil.getVectorIndexPostingPrefix(7, 0x1842, 3);
+    String postingKey = HoodieTableMetadataUtil.getVectorIndexPostingKey(7, 0x1842, 3, "doc_987654");
+    int numFileGroups = 128;
+
+    assertEquals(clusterPrefix, HoodieTableMetadataUtil.getVectorIndexPostingRoutingKey(postingKey));
+    assertEquals(clusterPrefix, HoodieTableMetadataUtil.getVectorIndexPostingRoutingKey(shardPrefix));
+    assertEquals(HoodieTableMetadataUtil.mapRecordKeyToFileGroupIndex(clusterPrefix, numFileGroups),
+        HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(postingKey, numFileGroups));
+    assertEquals(HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(clusterPrefix, numFileGroups),
+        HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(postingKey, numFileGroups));
+    assertEquals(HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(shardPrefix, numFileGroups),
+        HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(postingKey, numFileGroups));
   }
 }

@@ -222,25 +222,12 @@ public class HoodieTableMetadataUtil {
   public static final String VECTOR_INDEX_GENERATION_MANIFEST_KEY_PREFIX = "M|";
   /** Fixed-width key family prefix for cluster metadata rows. */
   public static final String VECTOR_INDEX_CLUSTER_KEY_PREFIX = "C|";
-  /** Fixed-width key family prefix for assignment rows keyed by record key. */
-  public static final String VECTOR_INDEX_ASSIGNMENT_KEY_PREFIX = "A|";
   /** Fixed-width key family prefix for MDT-native posting rows. */
   public static final String VECTOR_INDEX_POSTING_KEY_PREFIX = "P|";
-  /** Legacy key prefix for forward-map rows storing cluster_id -> file_group_ids. */
-  public static final String VECTOR_INDEX_FG_MAPPING_KEY_PREFIX = "__fg__/";
-
   public static final Set<String> SUPPORTED_META_FIELDS_PARTITION_STATS = new HashSet<>(Arrays.asList(
       HoodieRecord.HoodieMetadataField.RECORD_KEY_METADATA_FIELD.getFieldName(),
       HoodieRecord.HoodieMetadataField.PARTITION_PATH_METADATA_FIELD.getFieldName(),
       HoodieRecord.HoodieMetadataField.COMMIT_TIME_METADATA_FIELD.getFieldName()));
-
-  public static String getVectorIndexFgMappingKey(int clusterId, String partitionPath) {
-    return VECTOR_INDEX_FG_MAPPING_KEY_PREFIX + clusterId + "/" + partitionPath;
-  }
-
-  public static boolean isVectorIndexFgMappingKey(String recordKey) {
-    return recordKey != null && recordKey.startsWith(VECTOR_INDEX_FG_MAPPING_KEY_PREFIX);
-  }
 
   public static String getVectorIndexGenerationManifestKey(int generationId) {
     return VECTOR_INDEX_GENERATION_MANIFEST_KEY_PREFIX
@@ -262,20 +249,12 @@ public class HoodieTableMetadataUtil {
     return recordKey != null && recordKey.startsWith(VECTOR_INDEX_CLUSTER_KEY_PREFIX);
   }
 
-  public static String getVectorIndexAssignmentKey(String recordKey) {
-    return VECTOR_INDEX_ASSIGNMENT_KEY_PREFIX + recordKey;
-  }
-
-  public static boolean isVectorIndexAssignmentKey(String recordKey) {
-    return recordKey != null && recordKey.startsWith(VECTOR_INDEX_ASSIGNMENT_KEY_PREFIX);
-  }
-
   public static String getVectorIndexPostingKey(String generationId, int clusterId, String recordKey) {
-    return getVectorIndexPostingKey(Integer.parseInt(generationId), clusterId, 0, recordKey);
+    return getVectorIndexPostingKey(toVectorGenerationId(generationId), clusterId, 0, recordKey);
   }
 
   public static String getVectorIndexPostingKey(String generationId, int clusterId, int shardId, String recordKey) {
-    return getVectorIndexPostingKey(Integer.parseInt(generationId), clusterId, shardId, recordKey);
+    return getVectorIndexPostingKey(toVectorGenerationId(generationId), clusterId, shardId, recordKey);
   }
 
   public static String getVectorIndexPostingKey(int generationId, int clusterId, int shardId, String recordKey) {
@@ -295,6 +274,26 @@ public class HoodieTableMetadataUtil {
         + "|"
         + String.format("%08X", clusterId)
         + "|";
+  }
+
+  /**
+   * Convert arbitrary generation IDs (instant-like strings, numeric IDs) into a stable positive int
+   * key-space used by fixed-width vector metadata keys.
+   */
+  public static int toVectorGenerationId(String generationId) {
+    if (generationId == null) {
+      return 0;
+    }
+    try {
+      return Integer.parseInt(generationId);
+    } catch (NumberFormatException e) {
+      try {
+        long parsed = Long.parseLong(generationId);
+        return Math.floorMod((int) (parsed ^ (parsed >>> 32)), Integer.MAX_VALUE);
+      } catch (NumberFormatException ignored) {
+        return Math.floorMod(generationId.hashCode(), Integer.MAX_VALUE);
+      }
+    }
   }
 
   public static String getVectorIndexPostingPrefix(int generationId, int clusterId, int shardId) {
@@ -1552,6 +1551,26 @@ public class HoodieTableMetadataUtil {
     }
 
     return Math.abs(Math.abs(h) % numFileGroups);
+  }
+
+  public static int mapVectorPostingKeyToFileGroupIndex(String recordKey, int numFileGroups) {
+    return mapRecordKeyToFileGroupIndex(getVectorIndexPostingRoutingKey(recordKey), numFileGroups);
+  }
+
+  public static String getVectorIndexPostingRoutingKey(String metadataRecordKey) {
+    if (!isVectorIndexPostingKey(metadataRecordKey)) {
+      return metadataRecordKey;
+    }
+    int separatorCount = 0;
+    for (int i = 0; i < metadataRecordKey.length(); i++) {
+      if (metadataRecordKey.charAt(i) == '|') {
+        separatorCount++;
+        if (separatorCount == 3) {
+          return metadataRecordKey.substring(0, i + 1);
+        }
+      }
+    }
+    return metadataRecordKey;
   }
 
   /**

@@ -145,7 +145,7 @@ public class BulkInsertDataInternalWriterHelper {
           }
           idx += 1;
         }
-        InternalRow newRow = InternalRow.fromSeq(JavaScalaConverters.convertJavaListToScalaSeq(newCols));
+        InternalRow newRow = InternalRow.fromSeq(JavaScalaConverters.convertJavaListToScalaList(newCols));
         handle.write(newRow);
       } else {
         handle.write(row);
