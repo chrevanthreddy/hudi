@@ -29,6 +29,7 @@ import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFailedWritesCleaningPolicy;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieWriteStat;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
@@ -67,6 +68,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.apache.hudi.common.testutils.HoodieTestUtils.INSTANT_GENERATOR;
@@ -104,6 +106,25 @@ class TestHoodieBackedTableMetadataWriter {
   }
 
   @Test
+  void updateOnlyStreamingCommitDoesNotInferPartitionsFromEmptyStats() {
+    Set<MetadataPartitionType> streamedPartitionTypes = HoodieBackedTableMetadataWriter.getStreamedMetadataPartitionTypes(
+        Collections.emptyList(), true, List.of(MetadataPartitionType.RECORD_INDEX, MetadataPartitionType.SECONDARY_INDEX));
+
+    assertEquals(Set.of(MetadataPartitionType.RECORD_INDEX, MetadataPartitionType.SECONDARY_INDEX), streamedPartitionTypes);
+  }
+
+  @Test
+  void legacyStreamingCompletionStillReadsPartitionsFromWriteStats() {
+    HoodieWriteStat recordIndexStat = new HoodieWriteStat();
+    recordIndexStat.setPartitionPath(MetadataPartitionType.RECORD_INDEX.getPartitionPath());
+
+    Set<MetadataPartitionType> streamedPartitionTypes = HoodieBackedTableMetadataWriter.getStreamedMetadataPartitionTypes(
+        Collections.singletonList(recordIndexStat), false, Collections.emptyList());
+
+    assertEquals(Collections.singleton(MetadataPartitionType.RECORD_INDEX), streamedPartitionTypes);
+  }
+
+  @Test
   void completeStreamingCommitSkipsAlreadyCompletedMetadataInstant() {
     String instantTime = "20260709120000000";
     HoodieBackedTableMetadataWriter<List<HoodieRecord>, List<?>> metadataWriter =
@@ -120,7 +141,7 @@ class TestHoodieBackedTableMetadataWriter {
     when(completedTimeline.containsInstant(instantTime)).thenReturn(true);
     when(metadataWriter.initializeWriteClient()).thenReturn(writeClient);
 
-    metadataWriter.completeStreamingCommit(instantTime, engineContext, Collections.emptyList(), mock(HoodieCommitMetadata.class));
+    metadataWriter.completeStreamingCommit(instantTime, engineContext, Collections.emptyList(), mock(HoodieCommitMetadata.class), false);
 
     verify(writeClient).postCommit(instantTime);
     verifyNoMoreInteractions(writeClient);
