@@ -158,7 +158,7 @@ class TestHoodieBackedTableMetadataWriter {
 
     IllegalStateException clustering = assertThrows(IllegalStateException.class, () -> {
       if (streamingWrite) {
-        writer.completeStreamingCommit("001", mock(HoodieEngineContext.class), Collections.emptyList(), clusteringMetadata);
+        writer.completeStreamingCommit("001", mock(HoodieEngineContext.class), Collections.emptyList(), clusteringMetadata, false);
       } else {
         writer.update(clusteringMetadata, "001");
       }
@@ -180,7 +180,7 @@ class TestHoodieBackedTableMetadataWriter {
     when(writer.initializeWriteClient()).thenReturn(writeClient);
     writer.metadataMetaClient = metadataMetaClient;
 
-    writer.completeStreamingCommit("001", mock(HoodieEngineContext.class), Collections.emptyList(), clusteringMetadata);
+    writer.completeStreamingCommit("001", mock(HoodieEngineContext.class), Collections.emptyList(), clusteringMetadata, false);
 
     verify(writeClient).postCommit("001");
   }
