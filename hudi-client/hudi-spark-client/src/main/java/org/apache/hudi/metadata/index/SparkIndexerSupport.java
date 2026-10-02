@@ -19,15 +19,20 @@
 
 package org.apache.hudi.metadata.index;
 
+import org.apache.hudi.avro.model.HoodieVectorIndexCentroids;
+import org.apache.hudi.avro.model.HoodieVectorIndexManifest;
+import org.apache.hudi.avro.model.HoodieVectorIndexQuantizer;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.client.utils.SparkMetadataWriterUtils;
 import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.data.HoodieData;
+import org.apache.hudi.common.data.HoodieListData;
 import org.apache.hudi.common.data.HoodiePairData;
 import org.apache.hudi.common.engine.EngineType;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.engine.HoodieReaderContext;
 import org.apache.hudi.common.engine.ReaderContextFactory;
+import org.apache.hudi.common.index.vector.VectorIndexMetadataCache;
 import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieIndexDefinition;
@@ -40,6 +45,7 @@ import org.apache.hudi.common.schema.internal.InternalSchema;
 import org.apache.hudi.common.schema.internal.utils.SerDeHelper;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.HoodieTableVersion;
+import org.apache.hudi.common.table.read.BufferedRecord;
 import org.apache.hudi.common.table.read.HoodieFileGroupReader;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ValidationUtils;
@@ -48,8 +54,15 @@ import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieMetadataException;
 import org.apache.hudi.exception.HoodieNotSupportedException;
 import org.apache.hudi.index.expression.HoodieSparkExpressionIndex;
+import org.apache.hudi.metadata.HoodieMetadataPayload;
 import org.apache.hudi.metadata.HoodieTableMetadata;
+import org.apache.hudi.metadata.HoodieTableMetadataUtil;
 import org.apache.hudi.metadata.SparkVectorIndexBootstrap;
+import org.apache.hudi.metadata.SparkVectorIndexUpdater;
+import org.apache.hudi.metadata.VectorIndexMetadataKey;
+import org.apache.hudi.metadata.VectorMetadataRawKey;
+import org.apache.hudi.metadata.VectorRoutingArtifacts;
+import org.apache.hudi.metadata.index.vector.VectorIndexFileGroupUpdate;
 import org.apache.hudi.metadata.model.FileInfoAndPartition;
 import org.apache.hudi.metadata.model.FileSliceAndPartition;
 import org.apache.hudi.metadata.stats.HoodieColumnRangeMetadata;
@@ -65,9 +78,14 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -170,6 +188,244 @@ public class SparkIndexerSupport implements EngineIndexerSupport {
     } catch (Exception e) {
       throw new HoodieMetadataException("Failed to bootstrap vector index records", e);
     }
+  }
+
+  @Override
+  public HoodieData<HoodieRecord> generateVectorIndexUpdateRecords(
+      HoodieIndexDefinition indexDefinition,
+      HoodieTableMetaClient dataMetaClient,
+      HoodieTableMetadata tableMetadata,
+      List<VectorIndexFileGroupUpdate> fileGroupUpdates,
+      HoodieSchema tableSchema,
+      int generation,
+      String instantTime) {
+    if (fileGroupUpdates.isEmpty()) {
+      return engineContext.emptyHoodieData();
+    }
+    String vectorColumn = indexDefinition.getSourceFields().get(0);
+    HoodieSchema.Vector vectorSchema = (HoodieSchema.Vector) HoodieSchemaUtils
+        .getNestedField(tableSchema, vectorColumn)
+        .orElseThrow(() -> new HoodieMetadataException("Vector column not found: " + vectorColumn))
+        .getRight().schema().getNonNullType();
+    SparkVectorIndexUpdater.Artifacts artifacts = loadVectorArtifacts(
+        tableMetadata, indexDefinition.getIndexName(), generation, vectorSchema);
+    HoodieSchema requestedSchema = withRowIndexColumn(buildVectorKeyedSchema(
+        dataMetaClient, tableSchema, vectorColumn));
+    ReaderContextFactory<InternalRow> contextFactory = engineContext.getReaderContextFactory(dataMetaClient);
+    Option<InternalSchema> internalSchema = SerDeHelper.fromJson(dataWriteConfig.getInternalSchema());
+    TypedProperties readerProps = dataWriteConfig.getProps();
+    JavaSparkContext jsc = ((HoodieSparkEngineContext) engineContext).getJavaSparkContext();
+    JavaRDD<SparkVectorIndexUpdater.FileGroupRows> rows = jsc
+        .parallelize(fileGroupUpdates, Math.max(1, fileGroupUpdates.size()))
+        .map(update -> new SparkVectorIndexUpdater.FileGroupRows(
+            update.getPreviousSlice()
+                .map(slice -> readVectorRowsFromSlice(
+                    dataMetaClient, contextFactory.getContext(), tableSchema, requestedSchema,
+                    internalSchema, readerProps, vectorColumn, vectorSchema.getVectorElementType(),
+                    update.getPartitionPath(), slice, instantTime, false))
+                .orElse(Collections.emptyMap()),
+            readVectorRowsFromSlice(
+                dataMetaClient, contextFactory.getContext(), tableSchema, requestedSchema,
+                internalSchema, readerProps, vectorColumn, vectorSchema.getVectorElementType(),
+                update.getPartitionPath(), update.getCurrentSlice(),
+                instantTime, true)));
+    HoodieData<HoodieRecord> records = SparkVectorIndexUpdater.update(
+        rows, artifacts, vectorSchema.getVectorElementType(), generation,
+        instantTime, indexDefinition.getIndexName());
+    return HoodieTableMetadataUtil.reduceByKeys(
+        records, Math.max(1, fileGroupUpdates.size()), false);
+  }
+
+  private static Map<String, SparkVectorIndexBootstrap.VectorRow> readVectorRowsFromSlice(
+      HoodieTableMetaClient dataMetaClient,
+      HoodieReaderContext<InternalRow> readerContext,
+      HoodieSchema tableSchema,
+      HoodieSchema requestedSchema,
+      Option<InternalSchema> internalSchema,
+      TypedProperties readerProps,
+      String vectorColumn,
+      HoodieSchema.Vector.VectorElementType vectorType,
+      String partitionPath,
+      FileSlice fileSlice,
+      String instantTime,
+      boolean allowInflightInstants) {
+    Map<String, SparkVectorIndexBootstrap.VectorRow> rows = new LinkedHashMap<>();
+    try (HoodieFileGroupReader<InternalRow> reader = HoodieFileGroupReader.<InternalRow>builder()
+        .withReaderContext(readerContext)
+        .withHoodieTableMetaClient(dataMetaClient)
+        .withLatestCommitTime(instantTime)
+        .withDataSchema(tableSchema)
+        .withRequestedSchema(requestedSchema)
+        .withInternalSchemaOpt(internalSchema)
+        .withBaseFileOption(fileSlice.getBaseFile())
+        .withLogFiles(fileSlice.getLogFiles())
+        .withPartitionPath(partitionPath)
+        .withShouldUseRecordPosition(true)
+        .withAllowInflightInstants(allowInflightInstants)
+        .withProps(readerProps)
+        .build()) {
+      Set<String> logRecordKeys = new HashSet<>();
+      if (fileSlice.getLogFiles().findAny().isPresent()) {
+        try (ClosableIterator<BufferedRecord<InternalRow>> logIterator = reader.getLogRecordsOnly()) {
+          while (logIterator.hasNext()) {
+            logRecordKeys.add(logIterator.next().getRecordKey());
+          }
+        }
+      }
+      try (ClosableIterator<InternalRow> iterator = reader.getClosableIterator()) {
+        while (iterator.hasNext()) {
+          InternalRow record = iterator.next();
+          Object vector = readerContext.getRecordContext().getValue(record, requestedSchema, vectorColumn);
+          if (vector == null) {
+            continue;
+          }
+          String recordKey = readerContext.getRecordContext().getRecordKey(record, requestedSchema);
+          long rowPosition = logRecordKeys.contains(recordKey) ? -1L
+              : readerContext.getRecordContext().extractRecordPosition(
+                  record, requestedSchema, ROW_INDEX_TEMPORARY_COLUMN_NAME, -1L);
+          rows.put(recordKey, new SparkVectorIndexBootstrap.VectorRow(
+              recordKey, partitionPath, fileSlice.getFileId(), fileSlice.getBaseInstantTime(),
+              vectorBytes(vector, vectorType), rowPosition));
+        }
+      }
+    } catch (Exception e) {
+      throw new HoodieMetadataException(
+          "Failed to read vector rows from file group " + fileSlice.getFileId(), e);
+    }
+    return rows;
+  }
+
+  SparkVectorIndexUpdater.Artifacts loadVectorArtifacts(
+      HoodieTableMetadata tableMetadata,
+      String indexPartition,
+      int generation,
+      HoodieSchema.Vector vectorSchema) {
+    List<VectorMetadataRawKey> keys = new ArrayList<>();
+    keys.add(new VectorMetadataRawKey(VectorIndexMetadataKey.manifest(generation)));
+    keys.add(new VectorMetadataRawKey(VectorIndexMetadataKey.quantizer(generation, 0)));
+    Map<String, Object> metadata = new HashMap<>();
+    tableMetadata.getRecordsByKeyPrefixes(HoodieListData.eager(keys), indexPartition, true)
+        .collectAsList().forEach(record -> ((HoodieMetadataPayload) record.getData())
+            .getVectorIndexMetadata().ifPresent(value -> metadata.put(record.getRecordKey(), value)));
+    HoodieVectorIndexManifest manifest = VectorIndexMetadataCache.asManifest(
+        requireArtifact(metadata, VectorIndexMetadataKey.manifest(generation)));
+    HoodieVectorIndexQuantizer quantizer = VectorIndexMetadataCache.asQuantizer(
+        requireArtifact(metadata, VectorIndexMetadataKey.quantizer(generation, 0)));
+    if (!"ACTIVE".equals(manifest.getState())
+        || manifest.getDimension() != vectorSchema.getDimension()
+        || manifest.getNumClusters() <= 0
+        || manifest.getCentroidChunkCount() <= 0
+        || manifest.getShardCount() <= 0) {
+      throw new HoodieMetadataException("ACTIVE vector generation has invalid metadata geometry");
+    }
+
+    List<VectorMetadataRawKey> centroidKeys = new ArrayList<>(manifest.getCentroidChunkCount());
+    for (int chunk = 0; chunk < manifest.getCentroidChunkCount(); chunk++) {
+      centroidKeys.add(new VectorMetadataRawKey(VectorIndexMetadataKey.centroids(generation, chunk)));
+    }
+    Map<String, Object> centroidMetadata = new HashMap<>();
+    tableMetadata.getRecordsByKeyPrefixes(HoodieListData.eager(centroidKeys), indexPartition, true)
+        .collectAsList().forEach(record -> ((HoodieMetadataPayload) record.getData())
+            .getVectorIndexMetadata().ifPresent(
+                value -> centroidMetadata.put(record.getRecordKey(), value)));
+    List<HoodieVectorIndexCentroids> centroidChunks = new ArrayList<>(manifest.getCentroidChunkCount());
+    for (int chunk = 0; chunk < manifest.getCentroidChunkCount(); chunk++) {
+      centroidChunks.add(VectorIndexMetadataCache.asCentroids(requireArtifact(
+          centroidMetadata,
+          VectorIndexMetadataKey.centroids(generation, chunk))));
+    }
+
+    float[][] centroids = decodeCentroids(
+        centroidChunks, manifest.getNumClusters(), manifest.getDimension(),
+        vectorSchema.getVectorElementType());
+    Object routingModel = VectorRoutingArtifacts.restore(manifest, centroids);
+    return new SparkVectorIndexUpdater.Artifacts(
+        centroids,
+        routingModel,
+        manifest.getRoutingExpandRatio(),
+        manifest.getShardCount(),
+        manifest.getDimension(),
+        manifest.getBitsTotal(),
+        quantizer.getRandomSeed(),
+        manifest.getAssumeNormalized(),
+        manifest.getResidualEncoding());
+  }
+
+  private static Object requireArtifact(Map<String, Object> metadata, String key) {
+    Object value = metadata.get(key);
+    if (value == null) {
+      throw new HoodieMetadataException("ACTIVE vector generation artifact is missing: " + key);
+    }
+    return value;
+  }
+
+  private static float[][] decodeCentroids(
+      List<HoodieVectorIndexCentroids> chunks,
+      int numClusters,
+      int dimension,
+      HoodieSchema.Vector.VectorElementType elementType) {
+    float[][] centroids = new float[numClusters][dimension];
+    boolean[] populated = new boolean[numClusters];
+    for (HoodieVectorIndexCentroids chunk : chunks) {
+      ByteBuffer clusterIds = chunk.getClusterIds().duplicate().order(ByteOrder.LITTLE_ENDIAN);
+      ByteBuffer values = chunk.getCentroidBytes().duplicate().order(ByteOrder.LITTLE_ENDIAN);
+      int elementBytes = elementType.getElementSize();
+      if (values.remaining() != (long) (clusterIds.remaining() / Integer.BYTES) * dimension * elementBytes
+          || clusterIds.remaining() % Integer.BYTES != 0) {
+        throw new HoodieMetadataException("Malformed vector centroid chunk");
+      }
+      while (clusterIds.remaining() >= Integer.BYTES) {
+        int clusterId = clusterIds.getInt();
+        if (clusterId < 0 || clusterId >= numClusters || populated[clusterId]) {
+          throw new HoodieMetadataException("Invalid or duplicate vector centroid id " + clusterId);
+        }
+        for (int index = 0; index < dimension; index++) {
+          if (elementType == HoodieSchema.Vector.VectorElementType.DOUBLE) {
+            centroids[clusterId][index] = (float) values.getDouble();
+          } else if (elementType == HoodieSchema.Vector.VectorElementType.INT8) {
+            centroids[clusterId][index] = values.get();
+          } else {
+            centroids[clusterId][index] = values.getFloat();
+          }
+        }
+        populated[clusterId] = true;
+      }
+      if (clusterIds.hasRemaining() || values.hasRemaining()) {
+        throw new HoodieMetadataException("Malformed vector centroid chunk");
+      }
+    }
+    for (int clusterId = 0; clusterId < numClusters; clusterId++) {
+      if (!populated[clusterId]) {
+        throw new HoodieMetadataException("ACTIVE vector generation is missing centroid " + clusterId);
+      }
+    }
+    return centroids;
+  }
+
+  private static byte[] vectorBytes(
+      Object vectorValue, HoodieSchema.Vector.VectorElementType vectorType) {
+    if (vectorValue instanceof byte[]) {
+      return (byte[]) vectorValue;
+    }
+    if (vectorValue instanceof org.apache.spark.sql.catalyst.util.ArrayData) {
+      org.apache.spark.sql.catalyst.util.ArrayData array =
+          (org.apache.spark.sql.catalyst.util.ArrayData) vectorValue;
+      int elementBytes = vectorType.getElementSize();
+      ByteBuffer buffer = ByteBuffer.allocate(array.numElements() * elementBytes)
+          .order(ByteOrder.LITTLE_ENDIAN);
+      for (int index = 0; index < array.numElements(); index++) {
+        if (vectorType == HoodieSchema.Vector.VectorElementType.DOUBLE) {
+          buffer.putDouble(array.getDouble(index));
+        } else if (vectorType == HoodieSchema.Vector.VectorElementType.INT8) {
+          buffer.put(array.getByte(index));
+        } else {
+          buffer.putFloat(array.getFloat(index));
+        }
+      }
+      return buffer.array();
+    }
+    throw new HoodieMetadataException(
+        "Expected byte[] or ArrayData for VECTOR column, got " + vectorValue.getClass().getName());
   }
 
   /**

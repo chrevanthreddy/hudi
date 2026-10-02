@@ -29,6 +29,7 @@ import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.metadata.HoodieTableMetadata;
+import org.apache.hudi.metadata.index.vector.VectorIndexFileGroupUpdate;
 import org.apache.hudi.metadata.model.FileInfoAndPartition;
 import org.apache.hudi.metadata.model.FileSliceAndPartition;
 import org.apache.hudi.metadata.stats.HoodieColumnRangeMetadata;
@@ -122,4 +123,14 @@ public interface EngineIndexerSupport {
       HoodieSchema tableSchema,
       int generation,
       String sourceInstant);
+
+  /** Generates incremental records from merged previous/current slices of touched file groups. */
+  HoodieData<HoodieRecord> generateVectorIndexUpdateRecords(
+      HoodieIndexDefinition indexDefinition,
+      HoodieTableMetaClient dataMetaClient,
+      HoodieTableMetadata tableMetadata,
+      List<VectorIndexFileGroupUpdate> fileGroupUpdates,
+      HoodieSchema tableSchema,
+      int generation,
+      String instantTime);
 }
