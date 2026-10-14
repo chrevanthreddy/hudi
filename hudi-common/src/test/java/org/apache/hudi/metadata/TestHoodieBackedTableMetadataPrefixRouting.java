@@ -25,8 +25,10 @@ import org.apache.hudi.common.util.collection.Pair;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -82,6 +84,78 @@ class TestHoodieBackedTableMetadataPrefixRouting {
   }
 
   @Test
+  void exactArtifactKeysReadOnlyTheWritersFileGroup() {
+    List<FileSlice> slices = fileSlices(VECTOR_PARTITION, 512);
+    // The cold metadata-cache and updater lookups: each is one exact key of a fixed-length family.
+    List<String> exactKeys = Arrays.asList(
+        VectorIndexMetadataKey.activeManifest(),
+        VectorIndexMetadataKey.manifest(GENERATION),
+        VectorIndexMetadataKey.quantizer(GENERATION, 0),
+        VectorIndexMetadataKey.centroids(GENERATION, 0),
+        VectorIndexMetadataKey.centroids(GENERATION, 37),
+        VectorIndexMetadataKey.clusterStats(GENERATION, 16383));
+    for (String key : exactKeys) {
+      List<Pair<FileSlice, List<String>>> routed = HoodieBackedTableMetadata.routeKeyPrefixesToFileSlices(
+          VECTOR_PARTITION, Collections.singletonList(key), slices);
+      assertEquals(1, routed.size(), "exact artifact key must read one file group, not all 512");
+      // The writer tags the row with the same mapping over the same file-id-sorted slices.
+      assertEquals(slices.get(HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(key, slices.size())),
+          routed.get(0).getLeft());
+    }
+  }
+
+  @Test
+  void batchedExactKeysEachReachTheirOwnFileGroup() {
+    List<FileSlice> slices = fileSlices(VECTOR_PARTITION, 512);
+    List<String> keys = new ArrayList<>(Arrays.asList(
+        VectorIndexMetadataKey.manifest(GENERATION),
+        VectorIndexMetadataKey.quantizer(GENERATION, 0)));
+    IntStream.range(0, 40).forEach(chunk -> keys.add(VectorIndexMetadataKey.centroids(GENERATION, chunk)));
+    keys.sort(StringUtils.UTF8_LEXICOGRAPHIC_COMPARATOR);
+
+    List<Pair<FileSlice, List<String>>> routed =
+        HoodieBackedTableMetadata.routeKeyPrefixesToFileSlices(VECTOR_PARTITION, keys, slices);
+
+    assertEquals(keys.size(), routed.stream().mapToInt(p -> p.getRight().size()).sum(), "every key routed exactly once");
+    for (Pair<FileSlice, List<String>> sliceAndKeys : routed) {
+      sliceAndKeys.getRight().forEach(key -> assertEquals(
+          slices.get(HoodieTableMetadataUtil.mapVectorPostingKeyToFileGroupIndex(key, slices.size())), sliceAndKeys.getLeft()));
+      assertSorted(sliceAndKeys.getRight());
+    }
+  }
+
+  @Test
+  void prefixesThatCanSpanFileGroupsKeepFullFanOut() {
+    List<FileSlice> slices = fileSlices(VECTOR_PARTITION, 16);
+    // Family-only and truncated prefixes match rows hashed to many file groups; markers are
+    // variable length and are read by prefix scan, so neither may be routed.
+    List<String> unroutable = Arrays.asList(
+        familyPrefix(VectorIndexMetadataKey.FAMILY_MANIFEST),
+        familyPrefix(VectorIndexMetadataKey.FAMILY_CENTROIDS),
+        familyPrefix(VectorIndexMetadataKey.FAMILY_QUANTIZER),
+        familyPrefix(VectorIndexMetadataKey.FAMILY_CLUSTER_STATS),
+        familyPrefix(VectorIndexMetadataKey.FAMILY_POSTING),
+        VectorIndexMetadataKey.centroids(GENERATION, 0).substring(0, 5),
+        VectorIndexMetadataKey.sourceInstantMarkerPrefix(GENERATION),
+        VectorIndexMetadataKey.sourceInstantMarker(GENERATION, "20261014204057668"));
+    for (String prefix : unroutable) {
+      List<String> single = Collections.singletonList(prefix);
+      assertFullFanOut(HoodieBackedTableMetadata.routeKeyPrefixesToFileSlices(VECTOR_PARTITION, single, slices), slices, single);
+    }
+  }
+
+  @Test
+  void oneUnroutablePrefixKeepsFullFanOutForTheWholeLookup() {
+    List<FileSlice> slices = fileSlices(VECTOR_PARTITION, 16);
+    List<String> prefixes = new ArrayList<>(Arrays.asList(
+        VectorIndexMetadataKey.manifest(GENERATION),
+        familyPrefix(VectorIndexMetadataKey.FAMILY_CLUSTER_STATS)));
+    prefixes.sort(StringUtils.UTF8_LEXICOGRAPHIC_COMPARATOR);
+
+    assertFullFanOut(HoodieBackedTableMetadata.routeKeyPrefixesToFileSlices(VECTOR_PARTITION, prefixes, slices), slices, prefixes);
+  }
+
+  @Test
   void prefixWithoutClusterIdKeepsFullFanOut() {
     List<FileSlice> slices = fileSlices(VECTOR_PARTITION, 16);
     List<String> prefixes = new ArrayList<>(Arrays.asList(
@@ -100,6 +174,10 @@ class TestHoodieBackedTableMetadataPrefixRouting {
     List<String> prefixes = Arrays.asList(VectorIndexMetadataKey.postingPrefix(GENERATION, 3, 0));
 
     assertFullFanOut(HoodieBackedTableMetadata.routeKeyPrefixesToFileSlices(partition, prefixes, slices), slices, prefixes);
+  }
+
+  private static String familyPrefix(int family) {
+    return new String(new byte[] {(byte) family}, StandardCharsets.ISO_8859_1);
   }
 
   private static void assertFullFanOut(List<Pair<FileSlice, List<String>>> routed, List<FileSlice> slices, List<String> prefixes) {

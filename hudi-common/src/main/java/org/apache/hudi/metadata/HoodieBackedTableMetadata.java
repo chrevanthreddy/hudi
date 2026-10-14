@@ -264,19 +264,21 @@ public class HoodieBackedTableMetadata extends BaseTableMetadata {
   /**
    * Pairs each file slice with the key-prefixes it must be scanned for.
    *
-   * <p>Vector posting rows are routed to file groups at write time by IVF cluster id
-   * ({@link HoodieTableMetadataUtil#mapVectorPostingKeyToFileGroupIndex}, the
-   * {@link MetadataPartitionType#VECTOR_INDEX} file-group mapping). When every prefix carries a
-   * cluster id, each prefix is sent only to that cluster's file slice, using the same mapping
-   * and the same file-id-sorted slice order as the writer, so a probe of {@code nprobes} clusters
-   * reads at most {@code nprobes} file groups instead of all of them. Any other lookup keeps the
-   * full fan-out, because its prefixes may match records in every file group.
+   * <p>Vector index rows are routed to file groups at write time by
+   * {@link HoodieTableMetadataUtil#mapVectorPostingKeyToFileGroupIndex} (the
+   * {@link MetadataPartitionType#VECTOR_INDEX} file-group mapping): posting rows by IVF cluster id,
+   * every other row by a hash of its full key. When every prefix is routable (see
+   * {@link #isRoutableVectorKeyPrefix}), each one is sent only to the file slice the writer chose,
+   * using the same mapping and file-id-sorted slice order. A probe of {@code nprobes} clusters then
+   * reads at most {@code nprobes} file groups, and a singleton artifact (manifest, quantizer,
+   * centroids, cluster stats) reads one. Any other lookup keeps the full fan-out, because its
+   * prefixes may match records in every file group.
    */
   static List<Pair<FileSlice, List<String>>> routeKeyPrefixesToFileSlices(String partitionName,
                                                                        List<String> sortedKeyPrefixes,
                                                                        List<FileSlice> partitionFileSlices) {
     if (partitionFileSlices.size() <= 1 || sortedKeyPrefixes.isEmpty()
-        || !isClusterRoutedVectorPostingLookup(partitionName, sortedKeyPrefixes)) {
+        || !isRoutableVectorLookup(partitionName, sortedKeyPrefixes)) {
       return partitionFileSlices.stream()
           .map(fileSlice -> Pair.of(fileSlice, sortedKeyPrefixes))
           .collect(Collectors.toList());
@@ -293,9 +295,39 @@ public class HoodieBackedTableMetadata extends BaseTableMetadata {
         .collect(Collectors.toList());
   }
 
-  private static boolean isClusterRoutedVectorPostingLookup(String partitionName, List<String> sortedKeyPrefixes) {
+  private static boolean isRoutableVectorLookup(String partitionName, List<String> sortedKeyPrefixes) {
     return MetadataPartitionType.VECTOR_INDEX.matchesPartitionPath(partitionName)
-        && sortedKeyPrefixes.stream().allMatch(prefix -> HoodieTableMetadataUtil.extractVectorClusterId(prefix) >= 0);
+        && sortedKeyPrefixes.stream().allMatch(HoodieBackedTableMetadata::isRoutableVectorKeyPrefix);
+  }
+
+  /**
+   * A prefix is routable only if every row it can match lives in the one file group it maps to.
+   * That holds for posting prefixes carrying a cluster id (rows are placed by cluster), and for a
+   * complete key of a fixed-length family (no longer key can share the prefix, so the prefix scan
+   * is an exact lookup hashed exactly like the writer hashed the row). Family-only prefixes and
+   * source-instant markers (variable length) can span file groups and are not routable.
+   */
+  static boolean isRoutableVectorKeyPrefix(String keyPrefix) {
+    if (keyPrefix == null || keyPrefix.isEmpty()) {
+      return false;
+    }
+    int length = VectorIndexMetadataKey.decode(keyPrefix).length;
+    switch (Byte.toUnsignedInt(VectorIndexMetadataKey.decode(keyPrefix)[0])) {
+      case VectorIndexMetadataKey.FAMILY_POSTING:
+        return HoodieTableMetadataUtil.extractVectorClusterId(keyPrefix) >= 0;
+      case VectorIndexMetadataKey.FAMILY_ACTIVE_MANIFEST:
+        return length == VectorIndexMetadataKey.activeManifest().length();
+      case VectorIndexMetadataKey.FAMILY_MANIFEST:
+        return length == VectorIndexMetadataKey.manifest(0).length();
+      case VectorIndexMetadataKey.FAMILY_QUANTIZER:
+        return length == VectorIndexMetadataKey.quantizer(0, 0).length();
+      case VectorIndexMetadataKey.FAMILY_CENTROIDS:
+        return length == VectorIndexMetadataKey.centroids(0, 0).length();
+      case VectorIndexMetadataKey.FAMILY_CLUSTER_STATS:
+        return length == VectorIndexMetadataKey.clusterStats(0, 0).length();
+      default:
+        return false;
+    }
   }
 
   private static TreeSet<String> getDistinctSortedKeysForSingleSlice(HoodieData<String> keys) {
