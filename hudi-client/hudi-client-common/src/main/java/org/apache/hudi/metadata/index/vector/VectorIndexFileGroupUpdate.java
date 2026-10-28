@@ -26,17 +26,30 @@ import java.io.Serializable;
 
 /** Previous/current file-slice pair for one touched data file group. */
 public final class VectorIndexFileGroupUpdate implements Serializable {
-  private static final long serialVersionUID = 1L;
+  private static final long serialVersionUID = 2L;
 
   private final String partitionPath;
   private final Option<FileSlice> previousSlice;
   private final FileSlice currentSlice;
+  private final boolean relocatesExistingRows;
 
   public VectorIndexFileGroupUpdate(
       String partitionPath, Option<FileSlice> previousSlice, FileSlice currentSlice) {
+    this(partitionPath, previousSlice, currentSlice, false);
+  }
+
+  public VectorIndexFileGroupUpdate(
+      String partitionPath, Option<FileSlice> previousSlice, FileSlice currentSlice,
+      boolean relocatesExistingRows) {
     this.partitionPath = partitionPath;
     this.previousSlice = previousSlice;
     this.currentSlice = currentSlice;
+    this.relocatesExistingRows = relocatesExistingRows;
+  }
+
+  /** True when the commit (clustering) only moved already-indexed rows into this file group. */
+  public boolean relocatesExistingRows() {
+    return relocatesExistingRows;
   }
 
   public String getPartitionPath() {

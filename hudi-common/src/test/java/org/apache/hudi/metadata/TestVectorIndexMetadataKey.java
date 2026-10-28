@@ -122,6 +122,13 @@ class TestVectorIndexMetadataKey {
     assertNull(VectorIndexMetadataKey.exclusiveEnd(new String(new byte[] {(byte) 0xFF}, StandardCharsets.ISO_8859_1)));
   }
 
+  @Test
+  void testClusterStatsClusterIdRoundTripsAndRejectsOtherFamilies() {
+    assertEquals(42, VectorIndexMetadataKey.clusterStatsClusterId(VectorIndexMetadataKey.clusterStats(3, 42)));
+    assertEquals(-1, VectorIndexMetadataKey.clusterStatsClusterId(VectorIndexMetadataKey.postingPrefix(3, 42, 0)));
+    assertEquals(-1, VectorIndexMetadataKey.clusterStatsClusterId(VectorIndexMetadataKey.manifest(3)));
+  }
+
   private static void assertOrdered(String... keys) {
     for (int i = 1; i < keys.length; i++) {
       assertTrue(VectorIndexMetadataKey.compareUnsigned(keys[i - 1], keys[i]) < 0,

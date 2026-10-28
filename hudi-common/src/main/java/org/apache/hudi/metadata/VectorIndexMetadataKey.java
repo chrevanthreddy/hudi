@@ -158,6 +158,14 @@ public final class VectorIndexMetadataKey {
     return readInt(bytes, 5);
   }
 
+  public static int clusterStatsClusterId(String key) {
+    byte[] bytes = decode(key);
+    if (bytes.length != 9 || Byte.toUnsignedInt(bytes[0]) != FAMILY_CLUSTER_STATS) {
+      return -1;
+    }
+    return readInt(bytes, 5);
+  }
+
   public static int postingShard(String key) {
     byte[] bytes = decode(key);
     if (bytes.length < 11 || Byte.toUnsignedInt(bytes[0]) != FAMILY_POSTING) {

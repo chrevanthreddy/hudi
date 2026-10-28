@@ -20,6 +20,7 @@
 package org.apache.hudi.common.index.vector;
 
 import org.apache.hudi.avro.model.HoodieVectorIndexCentroids;
+import org.apache.hudi.avro.model.HoodieVectorIndexClusterStats;
 import org.apache.hudi.avro.model.HoodieVectorIndexManifest;
 import org.apache.hudi.avro.model.HoodieVectorIndexQuantizer;
 import org.apache.hudi.common.schema.HoodieSchema;
@@ -27,6 +28,9 @@ import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.avro.generic.GenericRecord;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 
 /** Avro conversion and binary decoding for vector index metadata artifacts. */
 final class VectorIndexMetadataSerde {
@@ -124,6 +128,27 @@ final class VectorIndexMetadataSerde {
     return info instanceof HoodieVectorIndexQuantizer
         ? ((HoodieVectorIndexQuantizer) info).getRandomSeed()
         : longField((GenericRecord) info, "randomSeed");
+  }
+
+  static HoodieVectorIndexClusterStats asClusterStats(Object info) {
+    if (info instanceof HoodieVectorIndexClusterStats) {
+      return (HoodieVectorIndexClusterStats) info;
+    }
+    GenericRecord record = (GenericRecord) info;
+    List<String> fileGroupIds = new ArrayList<>();
+    Object rawFileGroupIds = record.get("fileGroupIds");
+    if (rawFileGroupIds != null) {
+      ((Collection<?>) rawFileGroupIds).forEach(id -> fileGroupIds.add(id.toString()));
+    }
+    return new HoodieVectorIndexClusterStats(
+        intField(record, "routingVersion"),
+        intField(record, "shardCount"),
+        fileGroupIds,
+        longField(record, "liveCount"),
+        longField(record, "deltaCount"),
+        longField(record, "tombstoneCount"),
+        nullableStringField(record, "lastRebalanceInstant"),
+        longField(record, "lastUpdatedTs"));
   }
 
   static long clusterLiveCount(Object info) {

@@ -19,6 +19,7 @@
 
 package org.apache.hudi.metadata;
 
+import org.apache.hudi.avro.model.HoodieVectorIndexClusterStats;
 import org.apache.hudi.avro.model.HoodieVectorIndexPostingDelta;
 import org.apache.hudi.avro.model.HoodieVectorIndexTombstone;
 import org.apache.hudi.common.model.HoodieRecord;
@@ -234,6 +235,68 @@ class TestSparkVectorIndexUpdater {
         "id-1", "p1", "file-1", "001", previous.vectorBytes.clone(), 5L);
 
     assertTrue(classify(rows(previous), rows(current)).isEmpty());
+  }
+
+  @Test
+  void testClusteringRelocationRefreshesPostingWithoutCountingNewLiveRow() {
+    SparkVectorIndexBootstrap.VectorRow relocated = row(
+        "id-1", "p1", "file-new", "003", floats(1.0f, 2.0f), 0L);
+    SparkVectorIndexUpdater.FileGroupRows fileGroup = new SparkVectorIndexUpdater.FileGroupRows(
+        Collections.emptyMap(), rows(relocated), true);
+
+    List<HoodieRecord> postings = SparkVectorIndexUpdater.classifyPostingRecords(
+        fileGroup, ARTIFACTS, FLOAT, GENERATION, INSTANT, INDEX_PARTITION);
+    assertEquals(1, postings.size());
+    assertEquals("file-new", posting(postings.get(0)).getFileGroupId());
+
+    HoodieVectorIndexClusterStats stats = onlyStats(SparkVectorIndexUpdater.classifyClusterStatsRecords(
+        fileGroup, ARTIFACTS, FLOAT, Collections.singletonMap(0, persistedStats(7, 10L)),
+        GENERATION, INDEX_PARTITION));
+    assertEquals(10L, stats.getLiveCount());
+    assertEquals(1L, stats.getDeltaCount());
+  }
+
+  @Test
+  void testClusterStatsApplyDeltaToPersistedStatsAndKeepShardCount() {
+    SparkVectorIndexBootstrap.VectorRow inserted = row(
+        "id-new", "p1", "file-1", "002", floats(1.0f, 2.0f), 3L);
+    SparkVectorIndexBootstrap.VectorRow deleted = row(
+        "id-old", "p1", "file-1", "001", floats(2.0f, 1.0f), 4L);
+    SparkVectorIndexUpdater.FileGroupRows fileGroup = new SparkVectorIndexUpdater.FileGroupRows(
+        rows(deleted), rows(inserted));
+
+    HoodieVectorIndexClusterStats stats = onlyStats(SparkVectorIndexUpdater.classifyClusterStatsRecords(
+        fileGroup, ARTIFACTS, FLOAT, Collections.singletonMap(0, persistedStats(7, 10L)),
+        GENERATION, INDEX_PARTITION));
+
+    assertEquals(10L, stats.getLiveCount());
+    assertEquals(1L, stats.getDeltaCount());
+    assertEquals(1L, stats.getTombstoneCount());
+    assertEquals(7, stats.getShardCount(), "incremental stats must keep the generation shard count");
+  }
+
+  @Test
+  void testClusterStatsWithoutPersistedRecordUseGenerationShardCount() {
+    SparkVectorIndexBootstrap.VectorRow inserted = row(
+        "id-new", "p1", "file-1", "002", floats(1.0f, 2.0f), 3L);
+
+    HoodieVectorIndexClusterStats stats = onlyStats(SparkVectorIndexUpdater.classifyClusterStatsRecords(
+        new SparkVectorIndexUpdater.FileGroupRows(Collections.emptyMap(), rows(inserted)),
+        ARTIFACTS, FLOAT, Collections.emptyMap(), GENERATION, INDEX_PARTITION));
+
+    assertEquals(1L, stats.getLiveCount());
+    assertEquals(1, stats.getShardCount());
+  }
+
+  private static HoodieVectorIndexClusterStats persistedStats(int shardCount, long liveCount) {
+    return new HoodieVectorIndexClusterStats(
+        0, shardCount, Collections.emptyList(), liveCount, 0L, 0L, null, 1L);
+  }
+
+  private static HoodieVectorIndexClusterStats onlyStats(List<HoodieRecord> records) {
+    assertEquals(1, records.size());
+    assertEquals(VectorIndexMetadataKey.clusterStats(GENERATION, 0), records.get(0).getRecordKey());
+    return assertInstanceOf(HoodieVectorIndexClusterStats.class, metadata(records.get(0)));
   }
 
   private static List<HoodieRecord> classify(

@@ -19,6 +19,9 @@
 
 package org.apache.hudi.metadata;
 
+import org.apache.hudi.avro.model.HoodieVectorIndexClusterStats;
+import org.apache.hudi.common.data.HoodieData;
+import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.index.vector.QuantizedVector;
 import org.apache.hudi.common.index.vector.RaBitQEncoder;
 import org.apache.hudi.common.model.HoodieRecord;
@@ -28,46 +31,69 @@ import org.apache.hudi.data.HoodieJavaRDD;
 import org.apache.hudi.spark.index.vector.TwoLevelKMeansBootstrap$;
 
 import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
 
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.Function;
 
 import scala.Tuple2;
 
 /** Applies the secondary-index-style classifier to touched vector file groups. */
 public final class SparkVectorIndexUpdater {
 
+  private static final String CHANGES_STORAGE_LEVEL = "MEMORY_AND_DISK_SER";
+
   private SparkVectorIndexUpdater() {
   }
 
-  public static HoodieJavaRDD<HoodieRecord> update(
+  /**
+   * Builds posting and cluster-stats records for the touched file groups.
+   *
+   * <p>Rows are read once per file group, but routing and RaBitQ encoding are spread over
+   * {@code encodeParallelism} partitions: a single rewritten file group can hold millions of rows,
+   * and encoding them inside the file-group read task serialized the whole commit on one core.
+   * Encoded changes are persisted under {@code cacheKey} because both postings and stats consume
+   * them; the cache is released with the commit through the regular Hudi release path.
+   *
+   * <p>Cluster stats are absolute values: the metadata payload keeps the newest stats record, so
+   * each delta is applied to the persisted stats loaded by {@code statsLoader}.
+   */
+  public static HoodieData<HoodieRecord> update(
       JavaRDD<FileGroupRows> fileGroups,
       Artifacts artifacts,
       HoodieSchema.Vector.VectorElementType vectorType,
+      int encodeParallelism,
+      HoodieEngineContext engineContext,
+      HoodieData.HoodieDataCacheKey cacheKey,
+      Function<Collection<Integer>, Map<Integer, HoodieVectorIndexClusterStats>> statsLoader,
       int generation,
       String instantTime,
       String indexPartition) {
-    JavaRDD<Change> changes = fileGroups.flatMap(fileGroup ->
-        classify(fileGroup, artifacts, vectorType).iterator());
-    JavaRDD<HoodieRecord> postings = changes.flatMap(change ->
-        change.postingRecords(generation, instantTime, indexPartition).iterator());
-    JavaRDD<HoodieRecord> stats = changes
+    HoodieJavaRDD<Change> changes = HoodieJavaRDD.of(fileGroups
+        .flatMap(fileGroup -> pendingChanges(fileGroup).iterator())
+        .repartition(Math.max(1, encodeParallelism))
+        .flatMap(pending -> encodeChange(pending, artifacts, vectorType).iterator()));
+    changes.persist(CHANGES_STORAGE_LEVEL, engineContext, cacheKey);
+    Map<Integer, ClusterDelta> deltas = new HashMap<>(HoodieJavaRDD.getJavaRDD(changes)
         .flatMapToPair(change -> change.statDeltas().iterator())
         .reduceByKey(ClusterDelta::plus)
-        .map(entry -> HoodieMetadataPayload.createVectorIndexClusterStatsRecord(
-            generation,
-            entry._1,
-            entry._2.liveCount,
-            entry._2.deltaCount,
-            entry._2.tombstoneCount,
-            indexPartition));
-    return HoodieJavaRDD.of(postings.union(stats));
+        .collectAsMap());
+    List<HoodieRecord> stats = clusterStatsRecords(
+        deltas, statsLoader.apply(deltas.keySet()), artifacts.shardCount, generation, indexPartition);
+    JavaRDD<HoodieRecord> postings = HoodieJavaRDD.getJavaRDD(changes).flatMap(change ->
+        change.postingRecords(generation, instantTime, indexPartition).iterator());
+    return HoodieJavaRDD.of(postings.union(
+        JavaSparkContext.fromSparkContext(fileGroups.context()).parallelize(stats, 1)));
   }
 
   @VisibleForTesting
@@ -85,39 +111,97 @@ public final class SparkVectorIndexUpdater {
     return records;
   }
 
+  /** Driver-local equivalent of the stats half of {@link #update}. */
+  @VisibleForTesting
+  static List<HoodieRecord> classifyClusterStatsRecords(
+      FileGroupRows fileGroup,
+      Artifacts artifacts,
+      HoodieSchema.Vector.VectorElementType vectorType,
+      Map<Integer, HoodieVectorIndexClusterStats> persistedStats,
+      int generation,
+      String indexPartition) {
+    Map<Integer, ClusterDelta> deltas = new HashMap<>();
+    for (Change change : classify(fileGroup, artifacts, vectorType)) {
+      change.statDeltas().forEach(delta -> deltas.merge(delta._1, delta._2, ClusterDelta::plus));
+    }
+    return clusterStatsRecords(deltas, persistedStats, artifacts.shardCount, generation, indexPartition);
+  }
+
   private static List<Change> classify(
       FileGroupRows fileGroup,
       Artifacts artifacts,
       HoodieSchema.Vector.VectorElementType vectorType) {
+    List<Change> changes = new ArrayList<>();
+    for (PendingChange pending : pendingChanges(fileGroup)) {
+      changes.addAll(encodeChange(pending, artifacts, vectorType));
+    }
+    return changes;
+  }
+
+  /** Cheap per-file-group pass: pairs rows by key and drops unchanged vectors before any encoding. */
+  private static List<PendingChange> pendingChanges(FileGroupRows fileGroup) {
     Set<String> recordKeys = new TreeSet<>(fileGroup.previousRows.keySet());
     recordKeys.addAll(fileGroup.currentRows.keySet());
-    List<Change> changes = new ArrayList<>();
+    List<PendingChange> pending = new ArrayList<>();
     for (String recordKey : recordKeys) {
       SparkVectorIndexBootstrap.VectorRow previous = fileGroup.previousRows.get(recordKey);
       SparkVectorIndexBootstrap.VectorRow current = fileGroup.currentRows.get(recordKey);
-      if (previous == null) {
-        EncodedRow encoded = tryEncode(current, artifacts, vectorType);
-        if (encoded != null) {
-          changes.add(new Change(null, encoded, ChangeType.INSERT));
-        }
-      } else if (current == null) {
-        EncodedRow routed = tryRoute(previous, artifacts, vectorType);
-        if (routed != null) {
-          changes.add(new Change(routed, null, ChangeType.DELETE));
-        }
-      } else if (!Arrays.equals(previous.vectorBytes, current.vectorBytes)) {
-        EncodedRow routed = tryRoute(previous, artifacts, vectorType);
-        EncodedRow encoded = tryEncode(current, artifacts, vectorType);
-        if (routed != null || encoded != null) {
-          changes.add(new Change(routed, encoded, ChangeType.VECTOR_UPDATE));
-        }
-      }
       // Equal vector bytes are a no-op, mirroring RecordIndexMapper and secondary-index updates:
       // rows are grouped per file group, so only the base instant / row position can differ here.
       // The existing posting stays authoritative; exact fetch falls back to key lookup when its
       // base instant no longer matches the live base file.
+      if (previous == null || current == null || !Arrays.equals(previous.vectorBytes, current.vectorBytes)) {
+        pending.add(new PendingChange(previous, current, fileGroup.relocatesExistingRows));
+      }
     }
-    return changes;
+    return pending;
+  }
+
+  private static List<Change> encodeChange(
+      PendingChange pending,
+      Artifacts artifacts,
+      HoodieSchema.Vector.VectorElementType vectorType) {
+    if (pending.previous == null) {
+      EncodedRow encoded = tryEncode(pending.current, artifacts, vectorType);
+      return encoded == null ? Collections.emptyList() : Collections.singletonList(new Change(
+          null, encoded, pending.relocatesExistingRow ? ChangeType.RELOCATE : ChangeType.INSERT));
+    }
+    if (pending.current == null) {
+      EncodedRow routed = tryRoute(pending.previous, artifacts, vectorType);
+      return routed == null ? Collections.emptyList()
+          : Collections.singletonList(new Change(routed, null, ChangeType.DELETE));
+    }
+    EncodedRow routed = tryRoute(pending.previous, artifacts, vectorType);
+    EncodedRow encoded = tryEncode(pending.current, artifacts, vectorType);
+    return routed == null && encoded == null ? Collections.emptyList()
+        : Collections.singletonList(new Change(routed, encoded, ChangeType.VECTOR_UPDATE));
+  }
+
+  private static List<HoodieRecord> clusterStatsRecords(
+      Map<Integer, ClusterDelta> deltas,
+      Map<Integer, HoodieVectorIndexClusterStats> persistedStats,
+      int defaultShardCount,
+      int generation,
+      String indexPartition) {
+    long lastUpdatedTs = System.currentTimeMillis();
+    List<HoodieRecord> records = new ArrayList<>(deltas.size());
+    new TreeMap<>(deltas).forEach((clusterId, delta) -> {
+      HoodieVectorIndexClusterStats persisted = persistedStats.get(clusterId);
+      // Routing fields (shard count, routing version, file groups) belong to the generation and
+      // must survive incremental maintenance; only the counters move.
+      HoodieVectorIndexClusterStats merged = persisted == null
+          ? new HoodieVectorIndexClusterStats(0, defaultShardCount, Collections.emptyList(),
+              delta.liveCount, delta.deltaCount, delta.tombstoneCount, null, lastUpdatedTs)
+          : new HoodieVectorIndexClusterStats(persisted.getRoutingVersion(), persisted.getShardCount(),
+              persisted.getFileGroupIds(),
+              persisted.getLiveCount() + delta.liveCount,
+              persisted.getDeltaCount() + delta.deltaCount,
+              persisted.getTombstoneCount() + delta.tombstoneCount,
+              persisted.getLastRebalanceInstant(), lastUpdatedTs);
+      records.add(HoodieMetadataPayload.createVectorIndexClusterStatsRecord(
+          generation, clusterId, merged, indexPartition));
+    });
+    return records;
   }
 
   private static EncodedRow tryEncode(
@@ -185,15 +269,47 @@ public final class SparkVectorIndexUpdater {
 
   /** Previous and current merged rows for one touched file group. */
   public static final class FileGroupRows implements Serializable {
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
     private final Map<String, SparkVectorIndexBootstrap.VectorRow> previousRows;
     private final Map<String, SparkVectorIndexBootstrap.VectorRow> currentRows;
+    private final boolean relocatesExistingRows;
 
     public FileGroupRows(
         Map<String, SparkVectorIndexBootstrap.VectorRow> previousRows,
         Map<String, SparkVectorIndexBootstrap.VectorRow> currentRows) {
+      this(previousRows, currentRows, false);
+    }
+
+    /**
+     * @param relocatesExistingRows true when the commit only moves already-indexed rows into this
+     *                              file group (clustering). Their rows were counted when first
+     *                              indexed, so new rows here refresh postings without changing
+     *                              live counts.
+     */
+    public FileGroupRows(
+        Map<String, SparkVectorIndexBootstrap.VectorRow> previousRows,
+        Map<String, SparkVectorIndexBootstrap.VectorRow> currentRows,
+        boolean relocatesExistingRows) {
       this.previousRows = previousRows;
       this.currentRows = currentRows;
+      this.relocatesExistingRows = relocatesExistingRows;
+    }
+  }
+
+  /** A keyed row pair whose vector changed; routing and encoding are deferred to executors. */
+  private static final class PendingChange implements Serializable {
+    private static final long serialVersionUID = 1L;
+    private final SparkVectorIndexBootstrap.VectorRow previous;
+    private final SparkVectorIndexBootstrap.VectorRow current;
+    private final boolean relocatesExistingRow;
+
+    private PendingChange(
+        SparkVectorIndexBootstrap.VectorRow previous,
+        SparkVectorIndexBootstrap.VectorRow current,
+        boolean relocatesExistingRow) {
+      this.previous = previous;
+      this.current = current;
+      this.relocatesExistingRow = relocatesExistingRow;
     }
   }
 
@@ -235,7 +351,9 @@ public final class SparkVectorIndexUpdater {
   private enum ChangeType {
     INSERT,
     DELETE,
-    VECTOR_UPDATE
+    VECTOR_UPDATE,
+    /** An already-indexed row rewritten into a new file group by clustering. */
+    RELOCATE
   }
 
   private static final class Change implements Serializable {
@@ -292,6 +410,11 @@ public final class SparkVectorIndexUpdater {
     }
 
     private List<Tuple2<Integer, ClusterDelta>> statDeltas() {
+      if (type == ChangeType.RELOCATE) {
+        // Same vector, same routing: the refreshed posting replaces the old one in place.
+        return Collections.singletonList(
+            new Tuple2<>(current.clusterId, new ClusterDelta(0, 1, 0)));
+      }
       if (type == ChangeType.INSERT) {
         return Collections.singletonList(
             new Tuple2<>(current.clusterId, new ClusterDelta(1, 1, 0)));
