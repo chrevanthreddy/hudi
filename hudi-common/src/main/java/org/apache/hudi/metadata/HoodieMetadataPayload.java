@@ -304,7 +304,9 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
     this.key = key;
     this.type = MetadataPartitionType.VECTOR_INDEX.getRecordType();
     this.vectorIndexMetadata = vectorIndexInfo;
-    this.isDeletedRecord = vectorIndexInfo instanceof HoodieVectorIndexTombstone;
+    // Posting tombstones are logical overlay records. A physical MDT delete would discard
+    // the tombstone and allow its packed posting to reappear during search.
+    this.isDeletedRecord = false;
   }
 
   /**
@@ -441,6 +443,15 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
         new HoodieMetadataPayload(recordKey, manifest));
   }
 
+  /** Rewrites a persisted generation manifest while retaining its routing and freshness fields. */
+  public static HoodieRecord<HoodieMetadataPayload> createVectorIndexManifestRecord(
+      HoodieVectorIndexManifest manifest, int generation, String metadataPartitionPath) {
+    String recordKey = VectorIndexMetadataKey.manifest(generation);
+    return new HoodieAvroRecord<>(
+        new HoodieKey(recordKey, metadataPartitionPath),
+        new HoodieMetadataPayload(recordKey, manifest));
+  }
+
   /** Populates routing geometry only for a bootstrap generation trained with two-level placement. */
   public static HoodieRecord<HoodieMetadataPayload> createVectorIndexRoutedManifestRecord(
       HoodieRecord<HoodieMetadataPayload> manifestRecord,
@@ -495,23 +506,16 @@ public class HoodieMetadataPayload implements HoodieRecordPayload<HoodieMetadata
         new HoodieMetadataPayload(recordKey, stats));
   }
 
+  /**
+   * Cluster stats are stored as absolute values and the newest record wins on merge, so callers
+   * pass the fully merged stats, including the generation's routing fields.
+   */
   public static HoodieRecord<HoodieMetadataPayload> createVectorIndexClusterStatsRecord(
       int generation,
       int clusterId,
-      long liveCount,
-      long deltaCount,
-      long tombstoneCount,
+      HoodieVectorIndexClusterStats stats,
       String metadataPartitionPath) {
     String recordKey = VectorIndexMetadataKey.clusterStats(generation, clusterId);
-    HoodieVectorIndexClusterStats stats = new HoodieVectorIndexClusterStats(
-        0,
-        1,
-        java.util.Collections.emptyList(),
-        liveCount,
-        deltaCount,
-        tombstoneCount,
-        null,
-        0L);
     return new HoodieAvroRecord<>(
         new HoodieKey(recordKey, metadataPartitionPath),
         new HoodieMetadataPayload(recordKey, stats));

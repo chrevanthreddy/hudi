@@ -26,6 +26,7 @@ import org.apache.hudi.avro.model.HoodieVectorIndexManifest;
 import org.apache.hudi.avro.model.HoodieVectorIndexPostingDelta;
 import org.apache.hudi.avro.model.HoodieVectorIndexQuantizer;
 import org.apache.hudi.avro.model.HoodieVectorIndexSourceInstantMarker;
+import org.apache.hudi.avro.model.HoodieVectorIndexTombstone;
 import org.apache.hudi.common.model.HoodieRecord;
 
 import org.junit.jupiter.api.Test;
@@ -34,11 +35,22 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TestVectorIndexMetadataPayload {
+
+  @Test
+  void testPostingTombstoneSurvivesAsLogicalOverlayRecord() throws java.io.IOException {
+    HoodieRecord<HoodieMetadataPayload> record = HoodieMetadataPayload.createVectorIndexPostingDeleteRecord(
+        1, "moved", 2, 0, "20261002", "vector_index_demo");
+
+    assertFalse(record.getData().isDeleted());
+    assertTrue(record.getData().getInsertValue(null).isPresent());
+    assertTrue(record.getData().getVectorIndexMetadata().get() instanceof HoodieVectorIndexTombstone);
+  }
 
   @Test
   void testPostingRecordCarriesCanonicalLookupMetadata() {
