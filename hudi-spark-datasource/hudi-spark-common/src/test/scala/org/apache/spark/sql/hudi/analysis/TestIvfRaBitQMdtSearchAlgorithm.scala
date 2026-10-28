@@ -20,12 +20,15 @@ package org.apache.spark.sql.hudi.analysis
 
 import org.apache.hudi.common.index.vector.{ScoredVectorPostingMatch, VectorIndexArbiter, VectorIndexMdtSearchUtils, VectorIndexOptions, VectorPostingMatch, VectorStalePolicy}
 import org.apache.hudi.common.model.HoodieRecordGlobalLocation
-import org.apache.hudi.common.table.timeline.{HoodieInstant, HoodieTimeline}
+import org.apache.hudi.common.table.HoodieTableMetaClient
+import org.apache.hudi.common.table.timeline.{HoodieArchivedTimeline, HoodieInstant, HoodieTimeline}
 import org.apache.hudi.common.table.timeline.versioning.DefaultInstantGenerator
 import org.apache.hudi.common.testutils.MockHoodieTimeline
+import org.apache.hudi.storage.StoragePath
 
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertSame, assertTrue}
 import org.junit.jupiter.api.Test
+import org.mockito.Mockito.{mock, times, verify, when}
 
 import scala.collection.JavaConverters._
 
@@ -74,7 +77,7 @@ class TestIvfRaBitQMdtSearchAlgorithm {
   }
 
   @Test
-  def testRuntimeModeOverrideRecomputesImplicitFreshnessButPreservesExplicitOverride(): Unit = {
+  def testRuntimePolicyOverridesPersistedPolicyIndependentlyOfMode(): Unit = {
     val indexOptions = Map(
       VectorIndexOptions.QUERY_MODE -> "exact_rerank",
       VectorIndexOptions.FRESHNESS_POLICY -> "fail")
@@ -83,9 +86,18 @@ class TestIvfRaBitQMdtSearchAlgorithm {
       Map(VectorIndexOptions.QUERY_MODE -> "approximate"))
 
     assertEquals(
-      VectorStalePolicy.WARN,
+      VectorStalePolicy.FAIL,
       VectorIndexOptions.getFreshnessPolicy(approximateOptions.asJava))
+    assertEquals(VectorStalePolicy.FAIL, VectorIndexOptions.getFreshnessPolicy(
+      IvfRaBitQMdtSearchAlgorithm.resolvedTuningOptions(indexOptions, Map.empty).asJava))
+    assertEquals(VectorStalePolicy.WARN, VectorIndexOptions.getFreshnessPolicy(
+      IvfRaBitQMdtSearchAlgorithm.resolvedTuningOptions(indexOptions,
+        Map(VectorIndexOptions.FRESHNESS_POLICY -> "warn")).asJava))
 
+    assertEquals(VectorStalePolicy.FALLBACK, VectorIndexOptions.getFreshnessPolicy(
+      IvfRaBitQMdtSearchAlgorithm.resolvedTuningOptions(
+        indexOptions + (VectorIndexOptions.FRESHNESS_POLICY -> "fallback"),
+        Map(VectorIndexOptions.QUERY_MODE -> "approximate")).asJava))
     val explicitlyOverridden = IvfRaBitQMdtSearchAlgorithm.resolvedTuningOptions(
       indexOptions,
       Map(
@@ -119,9 +131,36 @@ class TestIvfRaBitQMdtSearchAlgorithm {
       .freshnessLag(Seq("001", "002", "003"), Some("001"))
       .get
 
+    assertEquals(None, IvfRaBitQMdtSearchAlgorithm.freshnessLag(Seq("001", "002", "003"), Some("001"), Set("002", "003")))
+    assertEquals("002", IvfRaBitQMdtSearchAlgorithm.freshnessLag(Seq("001", "002", "003"), Some("001"), Set("003")).get.firstUnmarkedInstant)
+    assertEquals("003", IvfRaBitQMdtSearchAlgorithm.freshnessLag(
+      Seq("002", "003", "004"), Some("001"), Set("002", "004")).get.firstUnmarkedInstant)
     assertEquals("002", lag.firstUnmarkedInstant)
     assertEquals(2, lag.lagCount)
     assertEquals(None, IvfRaBitQMdtSearchAlgorithm.freshnessLag(Seq("001"), Some("001")))
+  }
+
+  @Test
+  def testArchivedGapAndHistoryCacheInvalidation(): Unit = {
+    IvfRaBitQMdtSearchAlgorithm.resetMetadataCaches()
+    val generator = new DefaultInstantGenerator()
+    def timeline(instants: Seq[String]): HoodieTimeline = new MockHoodieTimeline(
+      instants.map(ts => generator.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.COMMIT_ACTION, ts)).asJava)
+    val active = timeline(Seq("004"))
+    val archived = mock(classOf[HoodieArchivedTimeline])
+    when(archived.getWriteTimeline).thenReturn(timeline(Seq("002", "003")))
+    val meta = mock(classOf[HoodieTableMetaClient])
+    when(meta.getBasePath).thenReturn(new StoragePath("/tmp/vector-archive-unit"))
+    when(meta.getArchivedTimeline("001", false)).thenReturn(archived)
+    val completed = IvfRaBitQMdtSearchAlgorithm.completedSourceWrites(meta, active, "001")
+    assertEquals(Seq("002", "003", "004"), completed)
+    assertEquals(None, IvfRaBitQMdtSearchAlgorithm.freshnessLag(Seq("004"), Some("001"), Set("002", "004")))
+    assertEquals("003", IvfRaBitQMdtSearchAlgorithm.freshnessLag(completed, Some("001"), Set("002", "004")).get.firstUnmarkedInstant)
+    IvfRaBitQMdtSearchAlgorithm.completedSourceWrites(meta, timeline(Seq("004", "005")), "001")
+    verify(meta, times(1)).getArchivedTimeline("001", false)
+    IvfRaBitQMdtSearchAlgorithm.completedSourceWrites(meta, timeline(Seq("005")), "001")
+    verify(meta, times(2)).getArchivedTimeline("001", false)
+    IvfRaBitQMdtSearchAlgorithm.resetMetadataCaches()
   }
 
   private def scoredCandidate(

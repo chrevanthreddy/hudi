@@ -27,6 +27,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -46,7 +47,8 @@ class TestVectorIndexOptions {
             VectorIndexOptions.QUERY_NUM_PROBES, "32",
             VectorIndexOptions.QUERY_REFINE_FACTOR, "50",
             VectorIndexOptions.QUERY_MODE, "exact_rerank",
-            VectorIndexOptions.FRESHNESS_POLICY, "fail",
+            VectorIndexOptions.FRESHNESS_STRICT, "false",
+            VectorIndexOptions.FRESHNESS_POLICY, "warn",
             VectorIndexOptions.STALE_LOCATOR_POLICY, "fallback",
             VectorIndexOptions.FETCH_VERIFY_KEYS, "true"),
         VectorIndexOptions.validateAndNormalize(opts()));
@@ -107,6 +109,7 @@ class TestVectorIndexOptions {
     assertInvalidValueContainsKey(VectorIndexOptions.METRIC, "manhattan");
     assertInvalidValueContainsKey(VectorIndexOptions.QUANTIZER, "pq");
     assertInvalidValueContainsKey(VectorIndexOptions.QUERY_MODE, "fast-ish");
+    assertInvalidValueContainsKey(VectorIndexOptions.FRESHNESS_STRICT, "yes");
     assertInvalidValueContainsKey(VectorIndexOptions.FRESHNESS_POLICY, "ignore");
     assertInvalidValueContainsKey(VectorIndexOptions.STALE_LOCATOR_POLICY, "ignore");
     assertInvalidValueContainsKey(VectorIndexOptions.RABITQ_ASSUME_NORMALIZED, "yes");
@@ -114,8 +117,10 @@ class TestVectorIndexOptions {
   }
 
   @Test
-  void testFreshnessDefaultDependsOnQueryModeWhileLocatorDefaultDoesNot() {
-    assertEquals(VectorStalePolicy.FAIL, VectorIndexOptions.getFreshnessPolicy(opts()));
+  void testFreshnessIsOptInAndDefaultsToWarn() {
+    assertFalse(VectorIndexOptions.isStrictFreshness(opts()));
+    assertTrue(VectorIndexOptions.isStrictFreshness(opts(VectorIndexOptions.FRESHNESS_STRICT, "true")));
+    assertEquals(VectorStalePolicy.WARN, VectorIndexOptions.getFreshnessPolicy(opts()));
     assertEquals(
         VectorStalePolicy.WARN,
         VectorIndexOptions.getFreshnessPolicy(opts(VectorIndexOptions.QUERY_MODE, "approximate")));

@@ -39,6 +39,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -85,6 +86,21 @@ class TestVectorIndexMetadataCacheRouting {
         Arrays.asList(
             VectorIndexMetadataKey.centroids(generation, 0),
             VectorIndexMetadataKey.quantizer(generation, 0))), observedKeys);
+  }
+
+  @Test
+  void missingBootstrapBaselineRejectsManifest() {
+    HoodieRecord<HoodieMetadataPayload> manifest = manifestRecord(7);
+    org.apache.hudi.avro.model.HoodieVectorIndexManifest info = VectorIndexMetadataCache.asManifest(
+        manifest.getData().getVectorIndexMetadata().get());
+    info.setBootstrapInstant(null);
+    HoodieTableMetadata metadata = mock(HoodieTableMetadata.class);
+    when(metadata.getRecordsByKeyPrefixes(any(), eq(INDEX_PARTITION), eq(true)))
+        .thenReturn(HoodieListData.eager(Arrays.asList(
+            HoodieMetadataPayload.createVectorIndexManifestRecord(info, 7, INDEX_PARTITION),
+            centroidsRecord(7))));
+    assertNull(VectorIndexMetadataCache.load(metadata, INDEX_PARTITION,
+        HoodieSchema.createVector(2, HoodieSchema.Vector.VectorElementType.FLOAT), "001", true));
   }
 
   private static HoodieRecord<HoodieMetadataPayload> centroidsRecord(int generation) {
