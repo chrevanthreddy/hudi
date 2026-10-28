@@ -20,6 +20,7 @@
 package org.apache.hudi.metadata.index;
 
 import org.apache.hudi.avro.model.HoodieVectorIndexCentroids;
+import org.apache.hudi.avro.model.HoodieVectorIndexClusterStats;
 import org.apache.hudi.avro.model.HoodieVectorIndexManifest;
 import org.apache.hudi.avro.model.HoodieVectorIndexQuantizer;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
@@ -59,6 +60,7 @@ import org.apache.hudi.metadata.HoodieTableMetadata;
 import org.apache.hudi.metadata.HoodieTableMetadataUtil;
 import org.apache.hudi.metadata.SparkVectorIndexBootstrap;
 import org.apache.hudi.metadata.SparkVectorIndexUpdater;
+import org.apache.hudi.metadata.VectorClusterRawKey;
 import org.apache.hudi.metadata.VectorIndexMetadataKey;
 import org.apache.hudi.metadata.VectorMetadataRawKey;
 import org.apache.hudi.metadata.VectorRoutingArtifacts;
@@ -78,6 +80,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -209,8 +212,8 @@ public class SparkIndexerSupport implements EngineIndexerSupport {
         .getRight().schema().getNonNullType();
     SparkVectorIndexUpdater.Artifacts artifacts = loadVectorArtifacts(
         tableMetadata, indexDefinition.getIndexName(), generation, vectorSchema);
-    HoodieSchema requestedSchema = withRowIndexColumn(buildVectorKeyedSchema(
-        dataMetaClient, tableSchema, vectorColumn));
+    HoodieSchema keyedSchema = buildVectorKeyedSchema(dataMetaClient, tableSchema, vectorColumn);
+    HoodieSchema positionalSchema = withRowIndexColumn(keyedSchema);
     ReaderContextFactory<InternalRow> contextFactory = engineContext.getReaderContextFactory(dataMetaClient);
     Option<InternalSchema> internalSchema = SerDeHelper.fromJson(dataWriteConfig.getInternalSchema());
     TypedProperties readerProps = dataWriteConfig.getProps();
@@ -220,20 +223,50 @@ public class SparkIndexerSupport implements EngineIndexerSupport {
         .map(update -> new SparkVectorIndexUpdater.FileGroupRows(
             update.getPreviousSlice()
                 .map(slice -> readVectorRowsFromSlice(
-                    dataMetaClient, contextFactory.getContext(), tableSchema, requestedSchema,
+                    dataMetaClient, contextFactory.getContext(), tableSchema,
+                    VectorSliceRowPositions.requestedSchema(slice, positionalSchema, keyedSchema),
                     internalSchema, readerProps, vectorColumn, vectorSchema.getVectorElementType(),
                     update.getPartitionPath(), slice, instantTime, false))
                 .orElse(Collections.emptyMap()),
             readVectorRowsFromSlice(
-                dataMetaClient, contextFactory.getContext(), tableSchema, requestedSchema,
+                dataMetaClient, contextFactory.getContext(), tableSchema,
+                VectorSliceRowPositions.requestedSchema(update.getCurrentSlice(), positionalSchema, keyedSchema),
                 internalSchema, readerProps, vectorColumn, vectorSchema.getVectorElementType(),
                 update.getPartitionPath(), update.getCurrentSlice(),
-                instantTime, true)));
+                instantTime, true),
+            update.relocatesExistingRows()));
+    String indexName = indexDefinition.getIndexName();
+    // Reading stays one task per file group, but encoding is spread across the cluster: a single
+    // clustered file group can hold millions of rows.
+    int encodeParallelism = Math.max(fileGroupUpdates.size(), jsc.defaultParallelism());
     HoodieData<HoodieRecord> records = SparkVectorIndexUpdater.update(
-        rows, artifacts, vectorSchema.getVectorElementType(), generation,
-        instantTime, indexDefinition.getIndexName());
+        rows, artifacts, vectorSchema.getVectorElementType(), encodeParallelism, engineContext,
+        HoodieData.HoodieDataCacheKey.of(
+            HoodieTableMetadata.getMetadataTableBasePath(dataMetaClient.getBasePath().toString()), instantTime),
+        clusterIds -> loadClusterStats(tableMetadata, indexName, generation, clusterIds),
+        generation, instantTime, indexName);
     return HoodieTableMetadataUtil.reduceByKeys(
-        records, Math.max(1, fileGroupUpdates.size()), false);
+        records, encodeParallelism, false);
+  }
+
+  private static Map<Integer, HoodieVectorIndexClusterStats> loadClusterStats(
+      HoodieTableMetadata tableMetadata, String indexPartition, int generation, Collection<Integer> clusterIds) {
+    if (clusterIds.isEmpty()) {
+      return Collections.emptyMap();
+    }
+    List<VectorClusterRawKey> keys = clusterIds.stream()
+        .map(clusterId -> new VectorClusterRawKey(generation, clusterId))
+        .collect(Collectors.toList());
+    Map<Integer, HoodieVectorIndexClusterStats> stats = new HashMap<>();
+    tableMetadata.getRecordsByKeyPrefixes(HoodieListData.eager(keys), indexPartition, true)
+        .collectAsList().forEach(record -> ((HoodieMetadataPayload) record.getData())
+            .getVectorIndexMetadata().ifPresent(value -> {
+              int clusterId = VectorIndexMetadataKey.clusterStatsClusterId(record.getRecordKey());
+              if (clusterIds.contains(clusterId)) {
+                stats.put(clusterId, VectorIndexMetadataCache.asClusterStats(value));
+              }
+            }));
+    return stats;
   }
 
   private static Map<String, SparkVectorIndexBootstrap.VectorRow> readVectorRowsFromSlice(
@@ -250,6 +283,8 @@ public class SparkIndexerSupport implements EngineIndexerSupport {
       String instantTime,
       boolean allowInflightInstants) {
     Map<String, SparkVectorIndexBootstrap.VectorRow> rows = new LinkedHashMap<>();
+    Map<String, Long> basePositions = VectorSliceRowPositions.basePositions(
+        dataMetaClient, readerProps, partitionPath, fileSlice);
     try (HoodieFileGroupReader<InternalRow> reader = HoodieFileGroupReader.<InternalRow>builder()
         .withReaderContext(readerContext)
         .withHoodieTableMetaClient(dataMetaClient)
@@ -260,12 +295,12 @@ public class SparkIndexerSupport implements EngineIndexerSupport {
         .withBaseFileOption(fileSlice.getBaseFile())
         .withLogFiles(fileSlice.getLogFiles())
         .withPartitionPath(partitionPath)
-        .withShouldUseRecordPosition(true)
+        .withShouldUseRecordPosition(VectorSliceRowPositions.readsRowIndex(fileSlice))
         .withAllowInflightInstants(allowInflightInstants)
         .withProps(readerProps)
         .build()) {
       Set<String> logRecordKeys = new HashSet<>();
-      if (fileSlice.getLogFiles().findAny().isPresent()) {
+      if (fileSlice.hasLogFiles()) {
         try (ClosableIterator<BufferedRecord<InternalRow>> logIterator = reader.getLogRecordsOnly()) {
           while (logIterator.hasNext()) {
             logRecordKeys.add(logIterator.next().getRecordKey());
@@ -281,8 +316,8 @@ public class SparkIndexerSupport implements EngineIndexerSupport {
           }
           String recordKey = readerContext.getRecordContext().getRecordKey(record, requestedSchema);
           long rowPosition = logRecordKeys.contains(recordKey) ? -1L
-              : readerContext.getRecordContext().extractRecordPosition(
-                  record, requestedSchema, ROW_INDEX_TEMPORARY_COLUMN_NAME, -1L);
+              : VectorSliceRowPositions.rowPosition(
+                  readerContext, record, requestedSchema, recordKey, fileSlice, basePositions);
           rows.put(recordKey, new SparkVectorIndexBootstrap.VectorRow(
               recordKey, partitionPath, fileSlice.getFileId(), fileSlice.getBaseInstantTime(),
               vectorBytes(vector, vectorType), rowPosition));
