@@ -21,6 +21,7 @@ import org.apache.hudi.SparkAdapterSupport
 import org.apache.hudi.client.common.HoodieSparkEngineContext
 import org.apache.hudi.common.config.HoodieMetadataConfig
 import org.apache.hudi.common.config.TypedProperties
+import org.apache.hudi.common.data.HoodieListData
 import org.apache.hudi.common.index.vector.{ScoredVectorPostingMatch, VectorDistanceMetric, VectorIndexArbiter, VectorIndexMdtSearchUtils, VectorIndexMetadataCache, VectorIndexOptions, VectorPostingMatch, VectorStalePolicy}
 import org.apache.hudi.common.model.{FileSlice, HoodieIndexDefinition, HoodieRecord}
 import org.apache.hudi.common.schema.HoodieSchema
@@ -31,7 +32,7 @@ import org.apache.hudi.common.table.view.HoodieTableFileSystemView
 import org.apache.hudi.core.index.record.HoodieRecordIndex
 import org.apache.hudi.data.HoodieJavaRDD
 import org.apache.hudi.hadoop.fs.HadoopFSUtils
-import org.apache.hudi.metadata.{HoodieTableMetadata, HoodieTableMetadataUtil}
+import org.apache.hudi.metadata.{HoodieTableMetadata, HoodieTableMetadataUtil, VectorIndexMetadataKey, VectorMetadataRawKey}
 
 import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.rdd.RDD
@@ -93,9 +94,10 @@ object IvfRaBitQMdtSearchAlgorithm extends VectorSearchAlgorithm with SparkAdapt
 
   private[analysis] def freshnessLag(
       completedWriteInstants: Seq[String],
-      coveredInstant: Option[String]): Option[FreshnessLag] = {
+      coveredInstant: Option[String],
+      markedInstants: Set[String] = Set.empty): Option[FreshnessLag] = {
     val uncovered = completedWriteInstants.filter(instant => coveredInstant.forall(covered =>
-      compareTimestamps(covered, InstantComparison.LESSER_THAN, instant)))
+      compareTimestamps(covered, InstantComparison.LESSER_THAN, instant)) && !markedInstants.contains(instant))
     uncovered.headOption.map(first => FreshnessLag(first, uncovered.size))
   }
 
@@ -133,17 +135,7 @@ object IvfRaBitQMdtSearchAlgorithm extends VectorSearchAlgorithm with SparkAdapt
   private[analysis] def resolvedTuningOptions(
       indexOptions: Map[String, String],
       runtimeOptions: Map[String, String]): Map[String, String] = {
-    val inherited = indexOptions
-      .filterNot { case (key, _) => STRUCTURAL_OPTION_KEYS.contains(key) }
-      // An explicit runtime mode change gets that mode's freshness default unless the caller also
-      // overrides freshness. Otherwise a persisted exact-mode default (FAIL) would leak into an
-      // approximate query whose contract default is WARN.
-      .filterNot { case (key, _) =>
-        key == VectorIndexOptions.FRESHNESS_POLICY &&
-          runtimeOptions.contains(VectorIndexOptions.QUERY_MODE) &&
-          !runtimeOptions.contains(VectorIndexOptions.FRESHNESS_POLICY)
-      }
-    inherited ++ runtimeOptions
+    indexOptions.filterNot { case (key, _) => STRUCTURAL_OPTION_KEYS.contains(key) } ++ runtimeOptions
   }
 
   /** Rejects structural keys (fixed at index build) and unknown keys, e.g. typos or retired options. */
@@ -274,19 +266,30 @@ object IvfRaBitQMdtSearchAlgorithm extends VectorSearchAlgorithm with SparkAdapt
     LOG.info(
       s"[vector_search][plan_context] basePath=$basePath latestInstant=${ctx.latestInstantTime} " +
         s"elapsedMs=${elapsedMs(contextStartNs)}")
-    val coveredInstant = ctx.cache.getLastContiguousSourceInstant
-    val lag = freshnessLag(
-      ctx.timeline.getInstantsAsStream.iterator.asScala.map(_.requestedTime()).toSeq,
-      Option(coveredInstant))
+    val coveredInstant = ctx.cache.getBootstrapInstant
+    val lag = if (!VectorIndexOptions.isStrictFreshness(ctx.tuningOptions.asJava)) {
+      None
+    } else {
+      // Opt-in conformance check: source markers are committed with the posting updates.
+      // Read the completed history, including archived writes; no mutable writer frontier is used.
+      val completed = completedSourceWrites(ctx.metaClient, ctx.timeline, coveredInstant)
+      val markerPrefix = VectorIndexMetadataKey.sourceInstantMarkerPrefix(ctx.cache.getGenerationId)
+      val marked = ctx.metadataTable.getRecordsByKeyPrefixes(
+        HoodieListData.eager(java.util.Collections.singletonList(new VectorMetadataRawKey(markerPrefix))),
+        ctx.indexPartition, true).collectAsList().asScala.map(_.getRecordKey).toSet
+      val covered = completed.filter(instant => marked.contains(
+        VectorIndexMetadataKey.sourceInstantMarker(ctx.cache.getGenerationId, instant))).toSet
+      freshnessLag(completed, Some(coveredInstant), covered)
+    }
     val staleFallbackPlan = lag.map { freshnessLag =>
       val freshnessPolicy = VectorIndexOptions.getFreshnessPolicy(ctx.tuningOptions.asJava)
       val firstUnmarkedInstant = freshnessLag.firstUnmarkedInstant
       val lagCount = freshnessLag.lagCount
       val staleMessage =
-        s"Vector index generation ${ctx.cache.getGenerationId} covers source writes through " +
+        s"Vector index generation ${ctx.cache.getGenerationId} has bootstrap baseline " +
           s"${Option(coveredInstant).getOrElse("<none>")} but the latest source data-write instant is ${ctx.latestInstantTime}; " +
           s"first unmarked instant=$firstUnmarkedInstant, lag count=$lagCount. " +
-          s"Run vector-index catch-up/replay (or rebuild the index until replay is available) to repair the marker gap"
+          s"Drop and recreate the vector index to repair the marker gap; catch-up/replay repair is not implemented"
       freshnessPolicy match {
         case VectorStalePolicy.FAIL =>
           throw new HoodieAnalysisException(staleMessage)
@@ -463,7 +466,33 @@ object IvfRaBitQMdtSearchAlgorithm extends VectorSearchAlgorithm with SparkAdapt
   private val metadataCachesLock = new Object
   @volatile private var metadataCaches: Map[MetadataCacheKey, VectorIndexMetadataCache] = Map.empty
 
+  // Cache only immutable archived history, never active writes or marker-validation outcomes.
+  // One entry per table; a changed baseline or active start replaces that table's old entry.
+  private case class ArchivedWrites(baseline: String, activeStart: Option[String], instants: Seq[String])
+  private var archivedWrites: Map[String, ArchivedWrites] = Map.empty
+
+  private[analysis] def completedSourceWrites(
+      metaClient: HoodieTableMetaClient,
+      active: HoodieTimeline,
+      baseline: String): Seq[String] = {
+    val activeInstants = active.getInstantsAsStream.iterator.asScala.map(_.requestedTime()).toSeq
+    val history = if (!active.isBeforeTimelineStarts(baseline)) Seq.empty else metadataCachesLock.synchronized {
+      val table = metaClient.getBasePath.toString
+      val start = activeInstants.headOption
+      archivedWrites.get(table) match {
+        case Some(cached) if cached.baseline == baseline && cached.activeStart == start => cached.instants
+        case _ =>
+          val loaded = completedSourceWriteTimeline(metaClient.getArchivedTimeline(baseline, false))
+            .getInstantsAsStream.iterator.asScala.map(_.requestedTime()).toSeq
+          archivedWrites = archivedWrites.updated(table, ArchivedWrites(baseline, start, loaded))
+          loaded
+      }
+    }
+    (history ++ activeInstants).distinct.sorted
+  }
+
   private[analysis] def resetMetadataCaches(): Unit = metadataCachesLock.synchronized {
+    archivedWrites = Map.empty
     metadataCaches = Map.empty
   }
 
@@ -486,7 +515,8 @@ object IvfRaBitQMdtSearchAlgorithm extends VectorSearchAlgorithm with SparkAdapt
           // counts fall back to the active generation manifest.
           val loaded = VectorIndexMetadataCache.load(metadataTable, indexPartition, vectorSchema, currentInstant, false)
           if (loaded == null) {
-            existingOpt.orNull
+            metadataCaches = metadataCaches - cacheKey
+            null
           } else {
             existingOpt match {
               case Some(existing) if Option(existing.getLoadInstant).exists(_.compareTo(loaded.getLoadInstant) > 0) =>

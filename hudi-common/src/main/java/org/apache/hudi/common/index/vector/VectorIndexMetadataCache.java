@@ -78,7 +78,7 @@ public final class VectorIndexMetadataCache implements Serializable {
   private final boolean residualEncoding;
   private final int defaultShardCount;
   private final Map<Integer, ClusterManifest> clusterManifests;
-  private final String lastContiguousSourceInstant;
+  private final String bootstrapInstant;
   private final String validForInstant;
 
   /**
@@ -119,7 +119,7 @@ public final class VectorIndexMetadataCache implements Serializable {
                                    boolean residualEncoding,
                                    int defaultShardCount,
                                    Map<Integer, ClusterManifest> clusterManifests,
-                                   String lastContiguousSourceInstant,
+                                   String bootstrapInstant,
                                    String validForInstant) {
     this.centroids = centroids;
     this.generationId = generationId;
@@ -130,7 +130,7 @@ public final class VectorIndexMetadataCache implements Serializable {
     this.residualEncoding = residualEncoding;
     this.defaultShardCount = Math.max(1, defaultShardCount);
     this.clusterManifests = Collections.unmodifiableMap(clusterManifests);
-    this.lastContiguousSourceInstant = lastContiguousSourceInstant;
+    this.bootstrapInstant = bootstrapInstant;
     this.validForInstant = validForInstant;
   }
 
@@ -246,6 +246,11 @@ public final class VectorIndexMetadataCache implements Serializable {
       return null;
     }
 
+    if (activeManifest.getBootstrapInstant() == null || activeManifest.getBootstrapInstant().toString().isEmpty()) {
+      LOG.warn("Vector metadata manifest has no bootstrap baseline: partition={}, generation={}", indexPartition, generationId);
+      return null;
+    }
+
     if (!shouldLoadClusterManifests) {
       records.addAll(metadataTable
           .getRecordsByKeyPrefixes(HoodieListData.eager(Arrays.asList(
@@ -346,8 +351,7 @@ public final class VectorIndexMetadataCache implements Serializable {
         residualEncoding,
         activeManifest.getShardCount(),
         clusterManifests,
-        activeManifest.getVerifiedFrontier() == null
-            ? null : activeManifest.getVerifiedFrontier().toString(),
+        activeManifest.getBootstrapInstant().toString(),
         currentInstant);
   }
 
@@ -426,8 +430,8 @@ public final class VectorIndexMetadataCache implements Serializable {
     return clusterManifests;
   }
 
-  public String getLastContiguousSourceInstant() {
-    return lastContiguousSourceInstant;
+  public String getBootstrapInstant() {
+    return bootstrapInstant;
   }
 
   public String getValidForInstant() {
@@ -497,6 +501,10 @@ public final class VectorIndexMetadataCache implements Serializable {
 
   public static HoodieVectorIndexQuantizer asQuantizer(Object info) {
     return VectorIndexMetadataSerde.asQuantizer(info);
+  }
+
+  public static HoodieVectorIndexClusterStats asClusterStats(Object info) {
+    return VectorIndexMetadataSerde.asClusterStats(info);
   }
 
   private static String getManifestState(Object info) {

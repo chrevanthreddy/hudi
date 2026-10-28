@@ -19,21 +19,34 @@
 
 package org.apache.hudi.metadata.index.vector;
 
+import org.apache.hudi.avro.model.HoodieVectorIndexActiveManifest;
 import org.apache.hudi.common.data.HoodieData;
+import org.apache.hudi.common.data.HoodieListData;
 import org.apache.hudi.common.engine.HoodieEngineContext;
+import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.index.vector.VectorIndexOptions;
+import org.apache.hudi.common.model.FileSlice;
+import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieIndexDefinition;
+import org.apache.hudi.common.model.HoodieLogFile;
 import org.apache.hudi.common.model.HoodieRecord;
+import org.apache.hudi.common.model.HoodieWriteStat;
+import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.schema.HoodieSchema;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.TableSchemaResolver;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
+import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.config.HoodieWriteConfig;
 import org.apache.hudi.exception.HoodieMetadataException;
 import org.apache.hudi.metadata.HoodieMetadataPayload;
 import org.apache.hudi.metadata.HoodieTableMetadataUtil;
 import org.apache.hudi.metadata.MetadataPartitionType;
+import org.apache.hudi.metadata.VectorIndexMetadataKey;
+import org.apache.hudi.metadata.VectorMetadataRawKey;
 import org.apache.hudi.metadata.index.BaseIndexer;
 import org.apache.hudi.metadata.index.EngineIndexerSupport;
 import org.apache.hudi.metadata.index.model.IndexCleanContext;
@@ -42,12 +55,19 @@ import org.apache.hudi.metadata.index.model.IndexInitializationPlan;
 import org.apache.hudi.metadata.index.model.IndexPartitionAndRecords;
 import org.apache.hudi.metadata.index.model.IndexUpdateContext;
 import org.apache.hudi.metadata.model.FileSliceAndPartition;
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.StoragePathInfo;
 
 import lombok.extern.slf4j.Slf4j;
+import org.apache.avro.generic.GenericRecord;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -60,8 +80,7 @@ import static org.apache.hudi.metadata.MetadataPartitionType.VECTOR_INDEX;
  * The engine-specific record generation (reading the source VECTOR column, IVF clustering and
  * RaBitQ quantization) is dispatched through {@link EngineIndexerSupport}.
  * <p>
- * Index update, clean and restore lifecycle is handled in a follow-up change; for now those hooks
- * are no-ops so the initial bootstrap path is self-contained and reviewable.
+ * Incremental updates use commit-derived file slices and the engine-specific posting updater.
  */
 @Slf4j
 public class VectorIndexer extends BaseIndexer {
@@ -186,14 +205,150 @@ public class VectorIndexer extends BaseIndexer {
 
   @Override
   public List<IndexPartitionAndRecords> buildUpdate(IndexUpdateContext context) {
-    // Vector index incremental maintenance (append/delete postings, generation advance) is handled
-    // in a follow-up change. Initialization is a full re-bootstrap until then.
-    return Collections.emptyList();
+    if (!VECTOR_INDEX.isMetadataPartitionAvailable(dataTableMetaClient)) {
+      return Collections.emptyList();
+    }
+    List<IndexPartitionAndRecords> partitionUpdates = new ArrayList<>();
+    for (String indexPartition : vectorIndexPartitions()) {
+      int generation = activeGeneration(context, indexPartition);
+      try {
+        HoodieIndexDefinition indexDefinition = HoodieTableMetadataUtil.getHoodieIndexDefinition(
+            indexPartition, dataTableMetaClient);
+        ValidationUtils.checkState(indexDefinition != null,
+            "Vector index definition is not present for index " + indexPartition);
+        HoodieData<HoodieRecord> records = rewritesRowsInPlace(context.commitMetadata().getOperationType())
+            ? engineContext.emptyHoodieData()
+            : engineIndexerSupport.generateVectorIndexUpdateRecords(
+                indexDefinition, dataTableMetaClient, context.tableMetadata(), buildFileGroupUpdates(context),
+                new TableSchemaResolver(dataTableMetaClient).getTableSchema(), generation, context.instantTime());
+        HoodieRecord marker = HoodieMetadataPayload.createVectorIndexSourceInstantMarkerRecord(
+            generation, context.instantTime(), indexPartition);
+        records = records.union(engineContext.parallelize(Collections.singletonList(marker), 1));
+        partitionUpdates.add(IndexPartitionAndRecords.of(indexPartition, records));
+      } catch (Exception e) {
+        throw new HoodieMetadataException(
+            "Failed to update vector index " + indexPartition + " for " + context.instantTime(), e);
+      }
+    }
+    return partitionUpdates;
+  }
+
+  /**
+   * Compaction rewrites rows inside their file group without changing any vector, and the record
+   * index keeps their locations, so postings stay valid; skipped like the record and secondary
+   * indexes do. The source-instant marker is still written for audit and opt-in read validation.
+   */
+  private static boolean rewritesRowsInPlace(WriteOperationType operationType) {
+    return operationType == WriteOperationType.COMPACT || operationType == WriteOperationType.LOG_COMPACT;
+  }
+
+  private List<VectorIndexFileGroupUpdate> buildFileGroupUpdates(IndexUpdateContext context) {
+    // Clustering rewrites already-indexed rows into new file groups. The replaced file groups are
+    // never revisited here, so their rows must not be counted again as live inserts.
+    boolean relocatesExistingRows = context.commitMetadata().getOperationType() == WriteOperationType.CLUSTER;
+    Map<String, List<HoodieWriteStat>> byFileGroup = context.commitMetadata()
+        .getPartitionToWriteStats().values().stream()
+        .flatMap(Collection::stream)
+        .collect(Collectors.groupingBy(
+            stat -> stat.getPartitionPath() + '\u0000' + stat.getFileId(),
+            LinkedHashMap::new,
+            Collectors.toList()));
+    HoodieTableFileSystemView view = context.lazyFileSystemView().get();
+    List<VectorIndexFileGroupUpdate> updates = new ArrayList<>(byFileGroup.size());
+    for (List<HoodieWriteStat> writeStats : byFileGroup.values()) {
+      String partition = writeStats.get(0).getPartitionPath();
+      String fileId = writeStats.get(0).getFileId();
+      Option<FileSlice> previous = view.getLatestMergedFileSliceBeforeOrOn(
+          partition, context.instantTime(), fileId).map(FileSlice::new);
+      updates.add(new VectorIndexFileGroupUpdate(
+          partition, previous, buildCurrentSlice(partition, fileId, context.instantTime(), previous, writeStats),
+          relocatesExistingRows));
+    }
+    return updates;
+  }
+
+  private FileSlice buildCurrentSlice(
+      String partition,
+      String fileId,
+      String instantTime,
+      Option<FileSlice> previous,
+      List<HoodieWriteStat> writeStats) {
+    StoragePath basePath = dataTableMetaClient.getBasePath();
+    List<HoodieWriteStat> baseStats = writeStats.stream()
+        .filter(stat -> !FSUtils.isLogFile(new StoragePath(basePath, stat.getPath())))
+        .collect(Collectors.toList());
+    ValidationUtils.checkArgument(baseStats.isEmpty() || baseStats.size() == 1,
+        "Only one new base file is expected per vector-index file-group update");
+    ValidationUtils.checkArgument(baseStats.isEmpty() || writeStats.size() == 1,
+        "A vector-index file-group update cannot mix a base file and log files");
+    if (!baseStats.isEmpty()) {
+      HoodieWriteStat stat = baseStats.get(0);
+      FileSlice current = new FileSlice(partition, instantTime, fileId);
+      current.setBaseFile(new HoodieBaseFile(new StoragePathInfo(
+          new StoragePath(basePath, stat.getPath()), stat.getFileSizeInBytes(),
+          false, (short) 0, 0, 0)));
+      return current;
+    }
+
+    List<HoodieLogFile> newLogFiles = writeStats.stream()
+        .map(stat -> new HoodieLogFile(new StoragePathInfo(
+            new StoragePath(basePath, stat.getPath()), stat.getFileSizeInBytes(),
+            false, (short) 0, 0, 0)))
+        .collect(Collectors.toList());
+    String baseInstant = previous.map(FileSlice::getBaseInstantTime)
+        .orElseGet(() -> newLogFiles.get(0).getDeltaCommitTime());
+    FileSlice current = previous.map(FileSlice::new)
+        .orElseGet(() -> new FileSlice(partition, baseInstant, fileId));
+    newLogFiles.forEach(current::addLogFile);
+    return current;
+  }
+
+  private int activeGeneration(IndexUpdateContext context, String indexPartition) {
+    Object metadata = readExactMetadata(
+        context, indexPartition, VectorIndexMetadataKey.activeManifest())
+        .orElseThrow(() -> new HoodieMetadataException(
+            "Active vector generation pointer is missing for " + indexPartition));
+    Integer generation;
+    if (metadata instanceof HoodieVectorIndexActiveManifest) {
+      generation = ((HoodieVectorIndexActiveManifest) metadata).getActiveGeneration();
+    } else if (metadata instanceof GenericRecord
+        && "HoodieVectorIndexActiveManifest".equals(
+            ((GenericRecord) metadata).getSchema().getName())) {
+      Object value = ((GenericRecord) metadata).get("activeGeneration");
+      generation = value == null ? null : ((Number) value).intValue();
+    } else {
+      throw new HoodieMetadataException(
+          "Unexpected active vector generation payload for " + indexPartition);
+    }
+    ValidationUtils.checkState(generation != null,
+        "Vector index has no ACTIVE generation for " + indexPartition);
+    return generation;
+  }
+
+  private Option<Object> readExactMetadata(
+      IndexUpdateContext context, String indexPartition, String exactKey) {
+    return Option.fromJavaOptional(context.tableMetadata()
+        .getRecordsByKeyPrefixes(
+            HoodieListData.eager(Collections.singletonList(new VectorMetadataRawKey(exactKey))),
+            indexPartition,
+            true)
+        .collectAsList().stream()
+        .filter(record -> exactKey.equals(record.getRecordKey()))
+        .map(record -> ((HoodieMetadataPayload) record.getData()).getVectorIndexMetadata())
+        .filter(Option::isPresent)
+        .map(Option::get)
+        .findFirst());
+  }
+
+  private Set<String> vectorIndexPartitions() {
+    return dataTableMetaClient.getTableConfig().getMetadataPartitions().stream()
+        .filter(partition -> partition.startsWith(VECTOR_INDEX.getPartitionPath()))
+        .collect(Collectors.toSet());
   }
 
   @Override
   public List<IndexPartitionAndRecords> buildClean(IndexCleanContext context) {
-    // See buildUpdate: lifecycle maintenance is handled in a follow-up change.
+    // Source writes are handled by buildUpdate; clean-driven vector maintenance is separate.
     return Collections.emptyList();
   }
 }

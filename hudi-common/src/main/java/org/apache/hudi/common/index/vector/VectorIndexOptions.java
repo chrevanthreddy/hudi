@@ -54,6 +54,7 @@ public final class VectorIndexOptions {
   public static final String QUERY_NUM_PROBES = "vector.query.nprobes";
   public static final String QUERY_REFINE_FACTOR = "vector.query.refine_factor";
   public static final String QUERY_MODE = "vector.query.mode";
+  public static final String FRESHNESS_STRICT = "vector.freshness.strict";
   public static final String FRESHNESS_POLICY = "vector.freshness.policy";
   public static final String STALE_LOCATOR_POLICY = "vector.stale.locator.policy";
   public static final String FETCH_VERIFY_KEYS = "vector.fetch.verify.keys";
@@ -67,7 +68,7 @@ public final class VectorIndexOptions {
   public static final int DEFAULT_NUM_PROBES = 32;
   public static final int DEFAULT_REFINE_FACTOR = 50;
   public static final VectorQueryMode DEFAULT_QUERY_MODE = VectorQueryMode.EXACT_RERANK;
-  public static final VectorStalePolicy DEFAULT_EXACT_FRESHNESS_POLICY = VectorStalePolicy.FAIL;
+  public static final VectorStalePolicy DEFAULT_EXACT_FRESHNESS_POLICY = VectorStalePolicy.WARN;
   public static final VectorStalePolicy DEFAULT_APPROXIMATE_FRESHNESS_POLICY = VectorStalePolicy.WARN;
   public static final VectorStalePolicy DEFAULT_STALE_LOCATOR_POLICY = VectorStalePolicy.FALLBACK;
   public static final boolean DEFAULT_FETCH_VERIFY_KEYS = true;
@@ -104,6 +105,7 @@ public final class VectorIndexOptions {
           QUERY_NUM_PROBES,
           QUERY_REFINE_FACTOR,
           QUERY_MODE,
+          FRESHNESS_STRICT,
           FRESHNESS_POLICY,
           STALE_LOCATOR_POLICY,
           FETCH_VERIFY_KEYS)));
@@ -154,6 +156,7 @@ public final class VectorIndexOptions {
         ? getNumProbes(options) : Math.min(DEFAULT_NUM_PROBES, numClusters);
     int refineFactor = getRefineFactor(options);
     VectorQueryMode queryMode = getQueryMode(options);
+    boolean strictFreshness = isStrictFreshness(options);
     VectorStalePolicy freshnessPolicy = getFreshnessPolicy(options);
     VectorStalePolicy staleLocatorPolicy = getStaleLocatorPolicy(options);
     boolean verifyFetchKeys = shouldVerifyFetchKeys(options);
@@ -177,6 +180,7 @@ public final class VectorIndexOptions {
     normalized.put(QUERY_NUM_PROBES, String.valueOf(numProbes));
     normalized.put(QUERY_REFINE_FACTOR, String.valueOf(refineFactor));
     normalized.put(QUERY_MODE, queryMode.name().toLowerCase(Locale.ROOT));
+    normalized.put(FRESHNESS_STRICT, String.valueOf(strictFreshness));
     normalized.put(FRESHNESS_POLICY, freshnessPolicy.name().toLowerCase(Locale.ROOT));
     normalized.put(STALE_LOCATOR_POLICY, staleLocatorPolicy.name().toLowerCase(Locale.ROOT));
     normalized.put(FETCH_VERIFY_KEYS, String.valueOf(verifyFetchKeys));
@@ -262,6 +266,10 @@ public final class VectorIndexOptions {
     } catch (IllegalArgumentException e) {
       throw unsupportedValue(QUERY_MODE, value, e);
     }
+  }
+
+  public static boolean isStrictFreshness(Map<String, String> options) {
+    return getBoolean(options, FRESHNESS_STRICT, false);
   }
 
   public static VectorStalePolicy getFreshnessPolicy(Map<String, String> options) {
