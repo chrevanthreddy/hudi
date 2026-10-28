@@ -142,21 +142,16 @@ class TestSparkVectorIndexUpdater {
   }
 
   @Test
-  void testLocatorOnlyRewriteEmitsNewPostingWithoutTombstone() {
+  void testUnchangedVectorUnderRewrittenBaseFileIsNoOp() {
+    // A COW merge or compaction rewrites the file group under a new base instant and may shift
+    // row positions; like RLI and SI, an unchanged indexed value emits no index update.
     byte[] vector = floats(1.0f, 2.0f);
     SparkVectorIndexBootstrap.VectorRow previous = row(
         "id-1", "p1", "file-1", "001", vector, 5L);
     SparkVectorIndexBootstrap.VectorRow current = row(
-        "id-1", "p2", "file-2", "002", vector.clone(), 41L);
+        "id-1", "p1", "file-1", "002", vector.clone(), 41L);
 
-    List<HoodieRecord> records = classify(rows(previous), rows(current));
-
-    assertEquals(1, records.size());
-    HoodieVectorIndexPostingDelta posting = posting(records.get(0));
-    assertEquals("p2", posting.getPartitionPath());
-    assertEquals("file-2", posting.getFileGroupId());
-    assertEquals("002", posting.getBaseInstantTime());
-    assertEquals(41L, posting.getRowPosition());
+    assertTrue(classify(rows(previous), rows(current)).isEmpty());
   }
 
   @Test

@@ -111,12 +111,11 @@ public final class SparkVectorIndexUpdater {
         if (routed != null || encoded != null) {
           changes.add(new Change(routed, encoded, ChangeType.VECTOR_UPDATE));
         }
-      } else if (!sameLocator(previous, current)) {
-        EncodedRow encoded = tryEncode(current, artifacts, vectorType);
-        if (encoded != null) {
-          changes.add(new Change(null, encoded, ChangeType.LOCATOR_UPDATE));
-        }
       }
+      // Equal vector bytes are a no-op, mirroring RecordIndexMapper and secondary-index updates:
+      // rows are grouped per file group, so only the base instant / row position can differ here.
+      // The existing posting stays authoritative; exact fetch falls back to key lookup when its
+      // base instant no longer matches the live base file.
     }
     return changes;
   }
@@ -184,15 +183,6 @@ public final class SparkVectorIndexUpdater {
     return vector;
   }
 
-  private static boolean sameLocator(
-      SparkVectorIndexBootstrap.VectorRow left,
-      SparkVectorIndexBootstrap.VectorRow right) {
-    return left.rowPosition == right.rowPosition
-        && left.partitionPath.equals(right.partitionPath)
-        && left.fileId.equals(right.fileId)
-        && left.baseInstantTime.equals(right.baseInstantTime);
-  }
-
   /** Previous and current merged rows for one touched file group. */
   public static final class FileGroupRows implements Serializable {
     private static final long serialVersionUID = 1L;
@@ -245,8 +235,7 @@ public final class SparkVectorIndexUpdater {
   private enum ChangeType {
     INSERT,
     DELETE,
-    VECTOR_UPDATE,
-    LOCATOR_UPDATE
+    VECTOR_UPDATE
   }
 
   private static final class Change implements Serializable {
@@ -310,10 +299,6 @@ public final class SparkVectorIndexUpdater {
       if (type == ChangeType.DELETE) {
         return Collections.singletonList(
             new Tuple2<>(previous.clusterId, new ClusterDelta(-1, 0, 1)));
-      }
-      if (type == ChangeType.LOCATOR_UPDATE) {
-        return Collections.singletonList(
-            new Tuple2<>(current.clusterId, new ClusterDelta(0, 1, 0)));
       }
       if (previous == null) {
         return Collections.singletonList(
